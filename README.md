@@ -39,6 +39,7 @@ decisions inherited rather than reinvented. See
     - [How a workspace gets its language](#how-a-workspace-gets-its-language)
     - [Vietnamese Series Bible and xưng hô](#vietnamese-series-bible-and-xưng-hô)
     - [Vietnamese QC and selective repair](#vietnamese-qc-and-selective-repair)
+    - [Vietnamese EPUB fonts](#vietnamese-epub-fonts)
     - [Web novel import (Syosetu / Kakuyomu)](#web-novel-import-syosetu--kakuyomu)
     - [Resume, truncation and dry runs](#resume-truncation-and-dry-runs)
     - [What is not supported yet](#what-is-not-supported-yet)
@@ -54,11 +55,11 @@ decisions inherited rather than reinvented. See
 
 ## What It Is
 
-A self-contained translation pipeline that ingests a Japanese EPUB, builds a
-full character/voice/continuity reference through one cache-oriented
-sequential prep conversation, translates every chapter through a
-high-capacity language model with automatic prefix caching, runs a zero-cost
-sanity gate, and outputs a finished English EPUB. On a sequel volume, it
+A self-contained translation pipeline that ingests a Japanese EPUB (or a
+Syosetu/Kakuyomu web novel), builds a full character/voice/continuity
+reference through one cache-oriented prep pass, translates every chapter
+through a high-capacity language model with prefix caching, runs a QC gate,
+and outputs a finished English or Vietnamese EPUB. On a sequel volume, it
 recalls the previous volume's names and voices without being told twice.
 
 ## What It Is NOT
@@ -71,9 +72,11 @@ recalls the previous volume's names and voices without being told twice.
 - It does **not** maintain a publisher/author/anime-metadata database — series
   continuity is three flat JSON files (name locks, recurring phrase anchors,
   cross-volume state), a continuity aid, not a database.
-- It does **not** run multiple providers per volume by default — every API
-  call in a given run uses the same single configured provider unless a
-  content-safety refusal triggers the DeepSeek fallback.
+- It does **not** mix translation providers within a volume by default —
+  every chapter goes through the one configured `translation.provider` unless
+  a content-safety refusal triggers the DeepSeek fallback. Prep has its own
+  switch (`prep.provider`), so prep and translation can use different
+  providers (the shipped config preps on OpenAI and translates on Anthropic).
 
 ## Quick Start
 
@@ -91,6 +94,8 @@ pip install -r requirements.txt
 
 # 4. Set your API key(s) in .env, matching whichever provider(s) you use:
 #    DEEPSEEK_API_KEY, QWEN_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY
+#    (or no key at all with --provider codex / --provider claude, see
+#    "Without an API key" below)
 
 # 5. Drop an EPUB in raw/
 copy "C:\path\to\your-light-novel.epub" raw\      # Windows
@@ -137,12 +142,14 @@ raw/                          ← Drop EPUBs here
     Sixteen JSON-node turns assembled deterministically into context.xml
     │
     ▼
-[Phase 2: Translator]         ← src/Deepseek/, src/Qwen/, src/OpenAI/, src/Anthropic/, src/Gemini/
+[Phase 2: Translator]         ← src/Deepseek/, src/Qwen/, src/OpenAI/, src/Anthropic/, src/Gemini/, src/CLI/
     One isolated route per provider — own client, prompt, conversation ledger, cache policy
+    (src/CLI/ drives the signed-in Codex CLI / Claude Code instead of an API)
     │
     ▼
-[QC Gate]                     ← src/utility/qc/ (filesystem-only, zero API cost)
+[QC Gate]                     ← src/utility/qc/ (EN: filesystem-only) · src/utility/vietnamese/ (VI)
     Completeness, truncation, token-count outliers, name-spelling drift, structural checks
+    VI adds locked-term/pronoun checks and an optional LLM semantic review (qc --llm)
     │
     ▼
 [Bible Writer]                ← reads populated context.xml
@@ -153,7 +160,7 @@ raw/                          ← Drop EPUBs here
     EPUB3 packaging, XHTML, NCX/TOC
     │
     ▼
-output/<vol_id>.epub          ← Finished English light novel
+output/<vol_id>.epub          ← Finished English light novel (Vietnamese: output/<title>_VI.epub)
 ```
 
 ### Providers
@@ -171,6 +178,11 @@ configured to call.
 | OpenAI | `src/OpenAI/` | Native Responses API (not a compatibility wrapper) with encrypted-reasoning replay and cache telemetry. See [OpenAI Responses](#openai-responses--application-and-cache-telemetry) |
 | Anthropic | `src/Anthropic/` | **Proofreading Mode** (Anthropic's beta advisor tool) as an in-loop proofreader and validator, plus opt-in `web_search`. See [Proofreading Mode](#proofreading-mode--powered-by-anthropics-advisor-tool) |
 | Google Gemini | `src/Gemini/` | Interactions API server-side conversation with implicit caching; Long Context + Long Decode (background, >64K output) on Gemini 4 Argon |
+| Codex CLI / Claude Code | `src/CLI/` | `--provider codex` / `--provider claude`: drives the signed-in CLI non-interactively and bills your ChatGPT/Claude plan, no API key. See [Without an API key](#without-an-api-key-codex-cli-or-claude-code) |
+
+The shipped `config.yaml` sets `translation.provider: anthropic` and
+`prep.provider: openai`; `--provider` / `--prep-provider` override either one
+for a single run.
 
 Every route receives the same prepared `context.xml` (voice guidance,
 terminology locks, scene/emotional guidance) and enforces the same
@@ -275,28 +287,43 @@ reference grounding (does a claimed subculture reference, public figure, or
 historical detail actually check out) and craft/proofreading judgment
 (name-form drift, locked-anchor collisions, register calls the executor is too
 close to its own prose to catch). `enabled: true` by default — eleven manual
-dry runs (`docs/anthropic-advisor-mode-plan.md`,
-`docs/anthropic-advisor-mode-spec.md`) closed out the validation this ships on.
+dry runs closed out the validation this ships on. The plan and spec they
+followed (`docs/anthropic-advisor-mode-plan.md`,
+`docs/anthropic-advisor-mode-spec.md`) are referenced by the config comments
+but are not included in this repository.
 
-**Model choice.** `advisor.model` selects which model does the consulting,
-among four options, each on Anthropic's own executor/advisor compatibility
-table (`ADVISOR_COMPATIBILITY` in `src/Anthropic/client.py`, checked fail-fast
-at startup):
+**Current configuration.** `config.yaml` ships with executor
+`translation.anthropic.model: claude-sonnet-5-5` and advisor
+`advisor.model: claude-opus-5-5`, with `advisor.enabled: true`. On a
+`claude-sonnet-5-5` executor, every advisor result comes back encrypted
+(`advisor_redacted_result`), whichever advisor is picked. The executor forces
+this, not the advisor.
 
-| Advisor model | Result type | Notes |
+**Model choice.** `advisor.model` picks the model that gives the advice. The
+pairing should be listed for the configured executor in
+`ADVISOR_COMPATIBILITY` (`src/Anthropic/client.py`), which mirrors Anthropic's
+executor/advisor compatibility table:
+
+| Executor (`model`) | Valid advisors | Result type |
 |---|---|---|
-| `claude-opus-4-8` (default) | plaintext `advisor_result`, human-readable | Validated in Runs 8–11. Requires executor `claude-sonnet-5`. |
-| `claude-sonnet-5` | plaintext | Same-tier peer to a `claude-sonnet-5` executor. |
-| `claude-opus-5` | encrypted `advisor_redacted_result` | Not compatible with `claude-opus-4-8` as executor. |
-| `claude-fable-5-1` | encrypted | Anthropic's own recommendation for maximum quality lift on a Sonnet executor; valid against every documented executor this route supports. |
+| `claude-sonnet-5-5` (current) | `claude-opus-5-5` (current), `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5-5`, `claude-fable-5`, `claude-mythos-5`, `claude-mythos-5-1` | Always encrypted |
+| `claude-sonnet-5` | `claude-opus-4-8`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-5`, `claude-opus-5-5`, `claude-fable-5`, `claude-fable-5-1`, `claude-mythos-5`, `claude-mythos-5-1` | Plaintext `advisor_result` for `claude-opus-4-8` / `claude-sonnet-5`; encrypted for the rest |
+| `claude-opus-5-5` | `claude-opus-5-5` (confirmed in live use 2026-09-24, though Anthropic's table does not list it), `claude-fable-5-1`, `claude-mythos-5-1` | Encrypted |
+| `claude-opus-5` | `claude-opus-5`, `claude-opus-5-5`, `claude-fable-5`, `claude-fable-5-1`, `claude-mythos-5`, `claude-mythos-5-1` | Encrypted |
+| `claude-fable-5-1` | `claude-fable-5-1`, `claude-mythos-5-1` | Encrypted |
 
-**Proofreading Mode is off by default.** The route's default executor is
-`claude-opus-5-5`, and Anthropic's advisor compatibility table documents no
-advisor for it, and does not list it as an advisor either (checked 2026-09-23). An
-undocumented pairing is not assumed valid, so `client.py` fails fast if
-`advisor.enabled: true` meets an Opus 5.5 executor. To run Proofreading Mode,
-set `model: claude-sonnet-5` (the executor Runs 1–11 validated it against)
-and `advisor.enabled: true`.
+`claude-opus-4-8` is not used in the current configuration. It is the
+plaintext advisor that Runs 8–11 validated, and it works **only** with a
+`claude-sonnet-5` executor. `claude-sonnet-5-5` returns a 400 for Opus 4.8,
+Opus 4.7, and Sonnet 5 advisors. To get readable plaintext advice back, set
+`model: claude-sonnet-5` and `advisor.model: claude-opus-4-8`. For a Sonnet
+executor, Anthropic recommends `claude-fable-5-1` as the advisor with the
+largest quality gain.
+
+An unlisted pairing is **not** refused. Startup logs a warning and lets the
+API make the final call: Anthropic returns a 400 on the first request if it
+rejects the pairing. The one advisor setting that still stops at startup is
+an effort level below `"high"`.
 
 **Economic gating.** `advisor.require_signal: true` (default) turns
 Proofreading Mode on for a request only when the chapter actually carries a
@@ -330,12 +357,15 @@ duty for both interiority and emphasis, and uniform acknowledgment tags. The
 advisor is directed to weigh in on these the same way it weighs in on
 name-form drift or a locked-anchor collision.
 
-**`web_search` (opt-in, independent of Proofreading Mode).** A separate,
-non-beta tool (`translation.anthropic.web_search`, `enabled: false` by
-default) a chapter can need independently of, alongside, or instead of
-Proofreading Mode — Run 9 confirmed all four combinations behave correctly.
-Off by default because its $10/1,000-search cost and query-level economy
-guardrail remain unvalidated at the same standard Proofreading Mode cleared.
+**`web_search` (independent of Proofreading Mode).** A separate, non-beta
+tool (`translation.anthropic.web_search`, type `web_search_20250305`) a
+chapter can need independently of, alongside, or instead of Proofreading
+Mode — Run 9 confirmed all four combinations behave correctly. The shipped
+`config.yaml` has it **on** (`enabled: true`) and gated by the same
+`require_signal` check as the advisor. Its $10/1,000-search cost and
+query-level economy guardrail have not been validated to the standard
+Proofreading Mode cleared, so set `enabled: false` if you want to avoid that
+spend.
 
 ### Safety-Refusal Fallback
 
@@ -372,7 +402,7 @@ content; material that reads as more explicitly sexual trips a refusal far
 more consistently, across most providers. Neither outcome reflects a defect
 in this pipeline — it is the provider's own policy surface, encountered live.
 
-In practice, DeepSeek shows the lowest refusal rate of the four routes and
+In practice, DeepSeek shows the lowest refusal rate of the API routes and
 the highest tolerance for ordinary genre material — including, in observed
 runs, chapters that a different route declined outright, which DeepSeek
 completed as ordinary translation work with no intervention needed.
@@ -386,7 +416,10 @@ on any provider, DeepSeek included.
 ### Prep — Cached Multi-turn Path
 
 `src/utility/prep/agent.py::run_prep()` builds `context.xml` before
-translation starts. Multi-turn is the active default path
+translation starts. `prep.provider` picks the route: `deepseek` (this
+section), `openai` (next section; the shipped default), or `codex` / `claude`
+(one long CLI call, see [Without an API key](#without-an-api-key-codex-cli-or-claude-code)).
+On the DeepSeek route, multi-turn is the active default path
 (`prep.multi_turn.enabled`); parallel cache-warmed fan-out remains available
 as an explicitly selected recovery strategy, and a one-shot unified call is
 the final fallback. The active path fails closed — a turn or assembly error
@@ -416,8 +449,13 @@ native Responses request is created for every active prep block; with
 `prep.openai.batch.enabled: true`, all of them are submitted in one durable
 OpenAI Batch job and tracked in `prep.openai.batch.persistence_file`. Completed
 JSON nodes are written under `.context/openai_prep/`, so an interrupted run can
-resume accepted work without resubmitting completed blocks. Set the flag to
-`false` to use the same block loop through synchronous Responses calls.
+resume accepted work without resubmitting completed blocks. The shipped
+config has the flag at `false`, which runs the same block loop through
+synchronous Responses calls.
+
+`prep --force-rerun` re-asks every block instead of reusing completed
+artifacts under `work/<vol>/.context/multiturn/`; without it a repeat run pays
+only for the turns that never finished.
 
 **Metadata search.** Before the conversation starts, prep resolves the
 volume's Japanese title/author against `web_search_chain.py`'s
@@ -845,78 +883,132 @@ One control surface per provider in `config.yaml`, selected by
 `translation.provider`:
 
 ```yaml
+project:
+  target_language: en       # default for NEW workspaces; --target overrides
+
+prep:
+  provider: openai          # deepseek | openai | codex | claude
+
 translation:
-  provider: deepseek        # deepseek | qwen | openai | anthropic | gemini
+  provider: anthropic       # deepseek | qwen | openai | anthropic | gemini | codex | claude
 
   deepseek:
     model: deepseek-v4-pro
-    thinking:
+  qwen:
+    model: qwen3.7-max
+  openai:
+    model: gpt-6-sol        # GPT-6 Luna is the fallback
+  anthropic:
+    model: claude-sonnet-5-5
+    advisor:                # Proofreading Mode
       enabled: true
-      budget_tokens: 48000
+      model: claude-opus-5-5
+  gemini:
+    model: gemini-4-argon
 
   safety_fallback:
     enabled: true            # default ON for every non-DeepSeek provider
+
+assistant:
+  provider: openai          # Vietnamese bible analysis, qc --llm, repair
+
+cli:                        # --provider codex / claude
+  subscription_only: true
+
+builder:
+  device_profile: standard  # passthrough | standard | xteink-x3 | xteink-x4
 ```
 
-See `config.yaml` for the full documented parameter set per provider —
-generation limits, thinking/effort controls, caching, conversation
-compaction, and continuation behavior are all configured independently per
-route.
+These are the values `config.yaml` ships with. See `config.yaml` itself for
+the full documented parameter set per provider — generation limits,
+thinking/effort controls, caching, Batch, conversation compaction, and
+continuation behavior are all configured independently per route.
 
 ---
 
 ## File Structure
 
 ```
-mtls/
+llm-trans/
 ├── config.yaml                 ← Master config: one section per provider + shared knobs
-├── requirements.txt            ← Python dependencies
+├── requirements.txt            ← Python dependencies (requirements-dev.txt adds pytest)
 ├── README.md                   ← This file
-├── mtl.bat / mtl.sh             ← CLI launcher (Windows / Linux+macOS)
+├── ARCHITECTURE.md             ← Maintainer-level architecture map
+├── mtl.bat / mtl.sh            ← CLI launcher (Windows / Linux+macOS)
+├── mtl-ts.bat / mtl-ts.sh      ← TypeScript console launcher
+├── .mcp.json                   ← Registers the MCP server for Claude Code
+├── fonts/                      ← Literata + Inter (SIL OFL) for Vietnamese EPUBs
+├── workflows/qc-gate.wf.mjs    ← Agent workflow: QC gate via the translation-evaluator skill
 │
 ├── src/
-│   ├── Deepseek/                ← Shared infrastructure (common/, mcp/) + the DeepSeek route
-│   │   └── common/
-│   │       ├── config.py, atomic_io.py, llm_types.py
-│   │       ├── token_telemetry.py    ← Shared pricing table, per-run cost log
-│   │       └── safety_fallback.py    ← Shared provider→DeepSeek content-refusal fallback
+│   ├── Deepseek/                ← Shared infrastructure + the DeepSeek route
+│   │   ├── common/              ← config, language, token_telemetry, safety_fallback,
+│   │   │                          chapter_signals, illustration_reinjection, ...
+│   │   ├── mcp/                 ← MCP server (server.py) + per-phase tool servers
+│   │   ├── prompt/              ← DeepSeek master prompts + prep prompt
+│   │   └── translator/          ← DeepSeek route
 │   ├── Qwen/                    ← Qwen route
-│   ├── OpenAI/                  ← OpenAI Responses route
-│   ├── Anthropic/               ← Anthropic Messages route
+│   ├── OpenAI/                  ← OpenAI Responses route (+ prep.py for OpenAI prep)
+│   ├── Anthropic/               ← Anthropic Messages route (+ Proofreading Mode, Batch)
 │   ├── Gemini/                  ← Gemini Interactions route
+│   ├── CLI/                     ← Codex CLI / Claude Code route (subscription, no API key)
+│   ├── prompts/vi/              ← Vietnamese master prompt
 │   ├── utility/
 │   │   ├── librarian/           ← Phase 1: EPUB extraction
-│   │   ├── prep/                ← context.xml builder
-│   │   └── qc/                  ← Filesystem-only sanity gate
-│   └── builder/                 ← Phase 4: EPUB assembly
+│   │   ├── prep/                ← context.xml builder (+ metadata web-search chain)
+│   │   ├── qc/                  ← English filesystem-only sanity gate
+│   │   ├── vietnamese/          ← VI bible, analysis, QC, alignment, repair
+│   │   └── webimport/           ← Syosetu / Kakuyomu import
+│   └── builder/                 ← Phase 4: EPUB assembly, device profiles, XTC export
 │
 ├── scripts/
-│   └── mtl.py                   ← CLI: extract, prep, translate, qc, build, run, list, status
+│   ├── mtl.py                   ← CLI (see CLI Reference)
+│   ├── reinject_illustrations.py← Re-insert illustration tags into a translated volume
+│   ├── ocr_extract.py, run_ocr.ps1, ocr_test_*.py  ← Optional JP OCR for page scans
+│   └── convert_agent_assets.py, validate_agent_assets.py  ← Agent/skill asset tooling
 │
+├── tests/                       ← unit/ + integration/ (offline by default)
 └── ts/                          ← TypeScript Ink/React terminal console (optional)
 ```
+
+`raw/`, `work/`, `output/`, `bibles/` and `logs/` are created at run time and
+are not part of the repository.
 
 ---
 
 ## CLI Reference
 
 ```bash
-python scripts/mtl.py extract <epub_path> [--target vi]   # Phase 1: EPUB → JP chapters + barebone context.xml
-python scripts/mtl.py import-url <url> [--target vi] [--range 1-50] [--refresh] [--run]
+python scripts/mtl.py extract <epub_path> [--target vi] [--volume-id ID] [--force-rerun]
+                                              # Phase 1: EPUB → JP chapters + barebone context.xml
+python scripts/mtl.py import-url <url> [--target vi] [--range 1-50] [--volume-id ID] [--refresh] [--no-extract] [--run]
                                               # Syosetu/Kakuyomu → JP workspace (same layout as extract)
-python scripts/mtl.py prep <vol_id> [--prep-provider P]   # Fills context.xml (VI: also seeds bible_vi.json)
-python scripts/mtl.py translate <vol_id> [--provider openai]   # Phase 2 into EN/ or VI/
-python scripts/mtl.py translate <vol_id> --dry-run   # Assemble the payload, send nothing
-python scripts/mtl.py qc <vol_id> [--llm] [--provider P]   # EN: filesystem-only gate. VI: Vietnamese QC (+ semantic review)
-python scripts/mtl.py repair <vol_id> ...     # VI: --mechanical | --severity S | --issue ID | --reset CHAPTER... | --reset all  [--provider P]
-python scripts/mtl.py bible-vi <vol_id> ...   # VI: --seed | --analyze [--chapters C...] [--provider P] | --lock | --promote | --show
-python scripts/mtl.py build <vol_id>          # Phase 4: translation → EPUB
-python scripts/mtl.py run <epub_path|url> [--target vi] [--provider P] [--prep-provider P]   # extract/import → prep → translate → qc → build
+python scripts/mtl.py prep <vol_id> [--series-id S] [--force-rerun] [--prep-provider P]
+                                              # Fills context.xml (VI: also seeds bible_vi.json)
+python scripts/mtl.py translate <vol_id> [--chapters C...] [--provider P] [--no-thinking-log] [--dry-run]
+                                              # Phase 2 into EN/ or VI/; --dry-run assembles the payload, sends nothing
+python scripts/mtl.py qc <vol_id> [--llm] [--dry-run] [--chapters C...] [--provider P]
+                                              # EN: filesystem-only gate. VI: Vietnamese QC (+ semantic review)
+python scripts/mtl.py repair <vol_id> ...     # VI: --mechanical | --severity S | --issue ID | --reset CHAPTER... | --reset all  [--chapters C...] [--dry-run] [--provider P]
+python scripts/mtl.py bible-vi <vol_id> ...   # VI: --seed | --analyze [--chapters C...] [--dry-run] [--provider P] | --lock | --promote [--series-id S] | --show
+python scripts/mtl.py build <vol_id> [--output NAME] [--profile PROFILE] [--emit-xtc xtc|xtch] [--dry-run]
+                                              # Phase 4: translation → EPUB
+python scripts/mtl.py run <epub_path|url> [--target vi] [--volume-id ID] [--series-id S] [--range R]
+                      [--provider P] [--prep-provider P] [--no-thinking-log] [--force-rerun]
+                                              # extract/import → prep → translate → qc → build
                                               # same URL again: adds new episodes to the existing workspace
-python scripts/mtl.py resume <vol_id> [--provider P] [--prep-provider P]   # Continue an interrupted volume
+python scripts/mtl.py resume <vol_id> [--provider P] [--prep-provider P] [--series-id S] [--skip-prep] [--no-thinking-log]
+                                              # Continue an interrupted volume
 python scripts/mtl.py list                    # List volumes in work/
 python scripts/mtl.py status <vol_id>         # Pipeline state, target language, chapter completion
 ```
+
+`--provider` accepts `deepseek`, `qwen`, `openai`, `anthropic`, `gemini`,
+`codex`, `claude` (the `qc`, `repair` and `bible-vi` assistant accepts only
+`openai`, `gemini`, `codex`, `claude`). `--prep-provider` accepts `deepseek`,
+`openai`, `codex`, `claude`. `build --profile` takes `passthrough`,
+`standard`, `xteink-x3` or `xteink-x4`; `--emit-xtc` needs an `xteink-*`
+profile and a configured `builder.xtc` converter.
 
 Without `--target`, every command behaves as before (English). If
 `EPUBCHECK_JAR` points at an `epubcheck.jar` and Java is installed, `build`
@@ -947,29 +1039,34 @@ for both Vietnamese and English. Nothing in the default run calls a paid API.
 ## MCP Tools
 
 An MCP server exposes every phase (Librarian, Prep, Translator, QC, Bible
-Writer, Builder) as a callable tool for IDE-agent integration — the agent
+Writer, Builder) as callable tools for IDE-agent integration — the agent
 calls one tool per phase instead of manually orchestrating sub-steps.
 
-| Server | Phase |
-|--------|-------|
-| Librarian | 1 |
-| Prep — `prep_volume(volume_id, series_id=None)` | 1.P |
-| Translator — `translate_chapter`, `run_translator` (both take `dry_run`) | 2 |
-| QC — `qc_volume(volume_id)` | Gate |
-| Bible — `write_bible(volume_id, series_id=None)` | Continuity |
-| Builder | 4 |
+| Server (`src/Deepseek/mcp/servers/`) | Tools | Phase |
+|--------|-------|-------|
+| Librarian | `run_librarian`, `extract_epub`, `parse_opf_metadata`, `parse_toc`, `convert_xhtml_to_markdown`, `detect_publisher`, `catalog_images`, `split_content` | 1 |
+| Prep | `prep_volume(volume_id, series_id=None)` | 1.P |
+| Translator | `translate_chapter`, `run_translator` (both take `dry_run`) | 2 |
+| QC | `qc_volume(volume_id)` | Gate |
+| Bible | `write_bible(volume_id, series_id=None)` | Continuity |
+| Builder | `run_builder`, `package_epub`, `markdown_to_xhtml`, `generate_opf`, `generate_nav`, `merge_translated_shards`, `optimize_image` | 4 |
 
-Start the server: `python -m src.Deepseek.mcp.server`
+Start the server: `python -m src.Deepseek.mcp.server` (Python MCP SDK 2.x).
+`.mcp.json` already registers it for Claude Code as `llm-translator`.
 
 ---
 
 ## Requirements
 
-- **Python** 3.11+
-- **Node.js** 20+ (TypeScript console only)
-- An API key for whichever provider(s) you configure, set via `.env`
+- **Python** 3.10+ (3.11+ for `scripts/validate_agent_assets.py`, which uses `tomllib`)
+- **Node.js** 20+ (TypeScript console only; 18+ for the optional XTC converter)
+- An API key for whichever provider(s) you configure, set via `.env` — or a
+  signed-in Codex CLI / Claude Code for `--provider codex|claude`
+- Optional: Java + `EPUBCHECK_JAR` for epubcheck validation in `build`
 
-Python packages: `anthropic`, `openai`, `pyyaml`, `python-dotenv`, `lxml`, `beautifulsoup4`, `Pillow`, `tiktoken`, `mcp`
+Python packages: `anthropic>=0.100`, `openai>=2.0`, `google-genai>=2.3`,
+`pyyaml`, `python-dotenv`, `lxml`, `beautifulsoup4`, `Pillow`, `tiktoken`,
+`mcp>=2.0` (the 2.x server API; 1.x does not work)
 
 ---
 
