@@ -1,0 +1,3160 @@
+"""
+Builder Agent - EPUB Assembly Orchestrator.
+
+Main entry point for Phase 4 of the MT Publishing Pipeline.
+Assembles final EPUB from translated content following industry standards
+(Yen Press / J-Novel Club conventions).
+"""
+
+import json
+import secrets
+import shutil
+import tempfile
+from pathlib import Path
+from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, List
+import xml.etree.ElementTree as ET
+
+from src.Deepseek.common.config import WORK_DIR, OUTPUT_DIR, OS_PATHS, get_target_language, get_language_config
+from .epub_structure import create_epub_structure, EPUBPaths
+from .opf_generator import OPFGenerator, BookMetadata, ManifestItem, SpineItem
+from .ncx_generator import NCXGenerator, NavPoint
+from .nav_generator import NavGenerator, TOCEntry, Landmark
+from .structure_builder import StructureBuilder
+from .xhtml_builder import XHTMLBuilder
+from .markdown_to_xhtml import MarkdownToXHTML, set_verse_epub_type
+from .epub_packager import EPUBPackager
+from .image_analyzer import get_image_dimensions, is_horizontal, analyze_kuchie_images
+from .merge_translated_shards_to_spine import merge_translated_shards_to_spine
+from .device_profiles import (
+    DeviceProfile,
+    PROFILE_NAMES,
+    describe_profile,
+    resolve_profile,
+)
+from .image_optimizer import EmitResult, optimize_image_to, summarize as summarize_images
+from .stylesheets import EINK_CSS, LANGUAGE_CSS, mark_dialogue_paragraphs
+from .config import get_xtc_config
+from .xtc_export import VALID_FORMATS as XTC_FORMATS, export_xtc
+from . import device_budgets
+from src.Deepseek.common.atomic_io import atomic_write_text
+import re
+
+# The leading H1 line every translated chapter emits ("# Chapter Title") —
+# a single '#' only, so a stray '## subheading' at the top of a chapter
+# never gets mistaken for the title.
+_CHAPTER_H1_RE = re.compile(r'^#(?!#)\s+(.+?)\s*$')
+
+# Editorial scratch note some prep/QC passes leave directly above the real H1
+# when a chapter title gets corrected in-file, e.g.:
+#   ## TITLE CORRECTION: Prep title "X" corrected to "Y" — ...
+# It documents the fix for a human reviewer, not for the reader of the book,
+# and must never ship as chapter content. Filtered out before H1 detection so
+# it is treated as discardable noise rather than "real body content" that
+# would trip the hard-fail in _extract_chapter_h1_title below.
+_TITLE_CORRECTION_ANNOTATION_RE = re.compile(r'^##\s*TITLE CORRECTION\s*:?', re.IGNORECASE)
+
+# A translation pass sometimes glues the chapter file's sequential "Chapter
+# NN:" label onto a section the JP source actually marks as a different
+# structural type (e.g. this volume's "Intermission 5 ─...─" headers,
+# rendered as "# Chapter 12: Intermission 5 — ..."). The file's ordinal
+# position in the manifest is not its structural type, and shipping both in
+# one nav/OPF title reads as a mislabeled chapter rather than what the
+# section actually is. Only strips the prefix when a recognized alternate
+# type immediately follows, so an ordinary "Chapter 12: Real Title" is
+# never touched.
+_MISLABELED_CHAPTER_PREFIX_RE = re.compile(
+    r'^Chapter\s+\d+\s*[:\-—–]\s*'
+    r'(?=(?:Intermission|Interlude|Epilogue|Prologue|Afterword)\b)',
+    re.IGNORECASE,
+)
+
+# <volume_identity> fields context.xml is expected to carry for every
+# volume once prep has run — see src/Deepseek/prompt/prep_prompt_deepseek_en.xml's
+# volume_identity block spec. No JP fallback on any of these: an empty
+# value means prep didn't populate it, and OPF assembly should stop, not
+# guess in Japanese.
+_REQUIRED_VOLUME_IDENTITY_FIELDS = ("title_en", "series_en", "author_en", "publisher")
+
+# Metadata localization adds English counterparts without modifying the source
+# fields, so an established volume may carry <publisher_en> instead of the
+# older generic <publisher>.  The builder still exports one OPF ``publisher``
+# value; this is only a read-side compatibility map for the context contract.
+_VOLUME_IDENTITY_FIELD_ALIASES = {
+    "publisher": ("publisher", "publisher_en"),
+}
+
+_WEB_SITE_PUBLISHERS = {
+    "syosetu": "Shōsetsuka ni Narō (ncode.syosetu.com)",
+    "kakuyomu": "Kakuyomu (kakuyomu.jp)",
+}
+
+
+def _web_import_publisher(work_dir: Path) -> str:
+    """Publisher for a workspace imported from a web novel site, else ''."""
+    try:
+        manifest = json.loads((Path(work_dir) / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    site = str((manifest.get("web_import") or {}).get("site") or "").strip()
+    return _WEB_SITE_PUBLISHERS.get(site, site)
+
+# A prior fan-out prep path wrote model prose directly into context.xml.  XML
+# entity references are not optional, so prose such as "Ikue & Shuichi" makes
+# the otherwise-valid context unreadable.  Keep this deliberately narrow: it
+# only repairs bare ampersands and leaves every other malformed XML shape to
+# the normal parser error rather than guessing at document structure.
+_BARE_XML_AMPERSAND_RE = re.compile(
+    r"&(?!(?:amp|lt|gt|apos|quot);|#\d+;|#x[0-9A-Fa-f]+;)"
+)
+
+
+def _resolve_verse_epub_type(root: ET.Element) -> str:
+    """
+    Read the verse semantic a volume declares for its poem containers.
+
+    Declared as <translation_policy verse_epub_type="z3998:song">, or on that
+    policy's first <form> as epub_type. Returns "" when the volume declares
+    nothing, which leaves the builder on its default.
+    """
+    policy = root.find("translation_policy")
+    if policy is None:
+        return ""
+    declared = (policy.get("verse_epub_type") or "").strip()
+    if not declared:
+        form = policy.find("form")
+        declared = (form.get("epub_type") or "").strip() if form is not None else ""
+    return declared
+
+
+def _escape_legacy_bare_ampersands(context_xml: str) -> str:
+    """Return ``context_xml`` with only invalid bare ampersands escaped."""
+    return _BARE_XML_AMPERSAND_RE.sub("&amp;", context_xml)
+
+
+# Industry-standard CSS for EPUB
+DEFAULT_CSS = '''/* Industry Standard EPUB Stylesheet */
+@charset "UTF-8";
+
+/* Base Styles */
+body {
+  font-family: Georgia, "Times New Roman", serif;
+  line-height: 1.6;
+  margin: 1em;
+  text-align: justify;
+}
+
+/* Headings */
+h1 {
+  text-align: center;
+  font-size: 1.5em;
+  margin: 2em 0 1em;
+  page-break-before: always;
+}
+
+h1:first-child {
+  page-break-before: avoid;
+}
+
+h1.post-header-title {
+  page-break-before: avoid;
+  margin-top: 1em;
+}
+
+/* Paragraphs */
+p {
+  text-indent: 1.5em;
+  margin: 0;
+}
+
+p.noindent, section > div > p:first-of-type {
+  text-indent: 0;
+}
+
+/* Blockquotes and lyric presentation */
+p.blockquote {
+  text-indent: 0;
+  margin: 0.35em 1.25em;
+}
+
+div.poem {
+  text-indent: 0;
+  margin: 1em 0 1em 1.5em;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+p.lyric {
+  text-indent: -1em;
+  padding-left: 1em;
+  margin: 0.05em 0;
+  text-align: left;
+}
+
+p.lyric-break {
+  text-indent: 0;
+  margin: 0.35em 0;
+}
+
+/* Structured blocks: in-world documents, message-board posts, cast lists,
+   aligned grids. These are never prose, so they never take the prose
+   first-line indent. */
+.note {
+  text-indent: 0;
+  margin: 0.5em 0;
+}
+
+.doc-list {
+  text-indent: 0;
+  margin: 0.6em 0 0.6em 1.5em;
+  padding: 0;
+}
+
+li {
+  text-indent: 0;
+  margin: 0.15em 0;
+}
+
+/* Scene Break - Force center alignment with maximum specificity */
+p.section-break,
+.section-break,
+p[class="section-break"] {
+  text-align: center !important;
+  text-indent: 0 !important;
+  margin: 1.5em auto !important;
+  padding: 0 !important;
+  display: block !important;
+  width: 100%;
+  max-width: 100%;
+}
+
+/* Emphasis */
+em {
+  font-style: italic;
+}
+
+strong {
+  font-weight: bold;
+}
+
+/* Footnotes */
+a.noteref {
+  vertical-align: super;
+  font-size: 0.75em;
+  text-decoration: none;
+  line-height: 0;
+}
+
+section.footnotes {
+  margin-top: 1.5em;
+  padding-top: 0.75em;
+  border-top: 1px solid #cccccc;
+}
+
+section.footnotes h2 {
+  text-indent: 0;
+  font-size: 1em;
+  margin: 0 0 0.5em 0;
+}
+
+section.footnotes ol {
+  margin: 0;
+  padding-left: 1.2em;
+}
+
+section.footnotes li {
+  margin: 0.35em 0;
+}
+
+section.footnotes p {
+  text-indent: 0;
+  margin: 0;
+}
+
+a.footnote-backref {
+  text-decoration: none;
+  margin-left: 0.35em;
+}
+
+/* Cover */
+.cover-image {
+  text-align: center;
+  text-indent: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.cover-image img {
+  max-width: 100%;
+  max-height: 100vh;
+  object-fit: contain;
+}
+
+/* Kuchi-e Images */
+img.fullpage {
+  display: block;
+  max-width: 100%;
+  max-height: 100vh;
+  margin: 0 auto;
+  object-fit: contain;
+}
+
+img.insert {
+  display: block;
+  max-width: 100%;
+  margin: 1em auto;
+  object-fit: contain;
+}
+
+p.illustration {
+  text-align: center;
+  text-indent: 0;
+  margin: 1em 0;
+}
+
+p.kuchie-image {
+  text-align: center;
+  text-indent: 0;
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+}
+
+/* Horizontal Kuchi-e (SVG-based) */
+.horizontal-kuchie {
+  text-align: center;
+  text-indent: 0;
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+}
+
+.horizontal-kuchie svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* Full-page insert images */
+.image_full {
+  text-align: center;
+  margin: 0;
+  padding: 0;
+  height: 100vh;
+}
+
+.image_full img.insert {
+  max-width: 100%;
+  max-height: 100vh;
+  object-fit: contain;
+}
+
+/* TOC */
+.toc-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.toc-list li {
+  margin: 0.5em 0;
+}
+
+.toc-list a {
+  text-decoration: none;
+  color: inherit;
+}
+
+nav#toc ol {
+  list-style: none;
+  padding-left: 0;
+}
+
+nav#toc li {
+  margin: 0.5em 0;
+}
+
+nav#toc a {
+  text-decoration: none;
+  color: inherit;
+}
+
+/* Main content wrapper */
+.main {
+  max-width: 100%;
+}
+'''
+
+
+# Stylesheet lookup by DeviceProfile.stylesheet key. EINK_CSS lives in
+# stylesheets.py rather than beside DEFAULT_CSS here, because device_profiles
+# needs to name a stylesheet and importing agent.py from it would cycle.
+STYLESHEETS = {
+    "default": DEFAULT_CSS,
+    "eink": EINK_CSS,
+}
+
+
+@dataclass
+class BuildResult:
+    """Result of EPUB build operation."""
+    success: bool
+    output_path: Optional[Path]
+    file_size_mb: float = 0.0
+    chapter_count: int = 0
+    image_count: int = 0
+    warnings: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+    # Set only when build_epub(dry_run=True) ran: no .epub was packaged and
+    # no manifest.json write happened. output_path stays None in that case;
+    # debug_dir is where the assembled-but-unpackaged OEBPS/ tree landed.
+    dry_run: bool = False
+    debug_dir: Optional[Path] = None
+    # Optional XTC/XTCH companion artifact. xtc_ok is None when no export was
+    # requested, False when one was requested and failed -- a failed export
+    # never fails the build, so these have to be distinguishable.
+    xtc_path: Optional[Path] = None
+    xtc_ok: Optional[bool] = None
+
+
+class BuilderAgent:
+    """
+    Orchestrates EPUB assembly from translated content.
+    Supports multi-language configuration (EN, VN, etc.)
+
+    Workflow:
+    1. Load manifest.json
+    2. Create EPUB directory structure (OEBPS/)
+    3. Convert markdown chapters to XHTML
+    4. Copy images to Images/
+    5. Generate navigation (nav.xhtml, toc.ncx)
+    6. Generate OPF manifest
+    7. Copy/create stylesheet
+    8. Package as .epub
+    9. Validate structure
+    """
+
+    def __init__(
+        self,
+        work_base: Optional[Path] = None,
+        output_base: Optional[Path] = None,
+        target_language: str = None,
+        profile: Optional[str] = None,
+    ):
+        """
+        Initialize Builder agent.
+
+        Args:
+            work_base: Base working directory (defaults to WORK/)
+            output_base: Output directory (defaults to OUTPUT/)
+            target_language: Target language code (e.g., 'en', 'vn').
+                            If None, uses current target language from config.
+            profile: Device profile name (passthrough | standard | xteink-x3 |
+                     xteink-x4). If None, uses builder.device_profile from
+                     config.yaml. Decides image sizing, colour depth, JPEG
+                     encoding and which stylesheet ships.
+        """
+        self.work_base = Path(work_base) if work_base else WORK_DIR
+        self.output_base = Path(output_base) if output_base else OUTPUT_DIR
+        self.output_base.mkdir(parents=True, exist_ok=True)
+
+        # Resolved here rather than at each use site, so an unknown name fails
+        # before any work is done instead of halfway through an image pass.
+        self.profile: DeviceProfile = resolve_profile(profile)
+
+        # Language configuration
+        self.target_language = target_language if target_language else get_target_language()
+        self.lang_config = get_language_config(self.target_language)
+        self.language_name = self.lang_config.get('language_name', self.target_language.upper())
+        self.language_code = self.lang_config.get('language_code', self.target_language)
+        self.output_suffix = self.lang_config.get('output_suffix', f'_{self.target_language.upper()}')
+
+    def _coerce_text(self, value: Any, fallback: str = "") -> str:
+        """
+        Normalize mixed manifest values (str/dict/list/etc.) to plain text.
+        """
+        if value is None:
+            return fallback
+        if isinstance(value, str):
+            text = value.strip()
+            return text if text else fallback
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, dict):
+            preferred_keys = (
+                "title_en", "title_english", "english", "title",
+                "name", "label", "text", "value", "romaji",
+                "title_jp", "japanese"
+            )
+            for key in preferred_keys:
+                if key in value:
+                    candidate = self._coerce_text(value.get(key), "")
+                    if candidate:
+                        return candidate
+            for candidate in value.values():
+                normalized = self._coerce_text(candidate, "")
+                if normalized:
+                    return normalized
+            return fallback
+        if isinstance(value, (list, tuple)):
+            parts = [self._coerce_text(v, "") for v in value]
+            parts = [p for p in parts if p]
+            return " / ".join(parts) if parts else fallback
+        text = str(value).strip()
+        return text if text else fallback
+
+    def _resolve_book_title(
+        self,
+        manifest: dict,
+        metadata_jp: dict,
+        metadata_translated: dict,
+        target_language: str,
+        fallback: str = "Unknown",
+    ) -> str:
+        """
+        Resolve localized book title with official-localization fallback.
+        """
+        title_key = f"title_{target_language}"
+        official_localization = metadata_translated.get("official_localization", {})
+        official_volume_key = f"volume_title_{target_language}"
+        official_series_key = f"series_title_{target_language}"
+        official_title = ""
+        if isinstance(official_localization, dict):
+            official_title = self._coerce_text(
+                official_localization.get(official_volume_key)
+                or official_localization.get("volume_title_en")
+                or official_localization.get(official_series_key)
+                or official_localization.get("series_title_en"),
+                "",
+            )
+
+        direct_title = self._coerce_text(metadata_translated.get("title"), "")
+
+        return self._coerce_text(
+            metadata_translated.get(title_key)
+            or direct_title
+            or metadata_translated.get("title_en")
+            or official_title
+            or manifest.get(title_key)
+            or manifest.get("title_en")
+            or metadata_jp.get("title", fallback),
+            fallback,
+        )
+
+    def _extract_localized_field(self, value: Any, target_language: str, field_name: str = "") -> str:
+        """
+        Extract a localized value from mixed schema fields (scalar or mapping).
+        """
+        if not isinstance(value, dict):
+            return self._coerce_text(value, "")
+
+        lang_aliases = {
+            "vn": ("vn", "vi", "vietnamese"),
+            "en": ("en", "english"),
+            "ja": ("ja", "jp", "japanese"),
+        }
+        aliases = lang_aliases.get(target_language, (target_language,))
+
+        candidate_keys = []
+        if field_name:
+            for alias in aliases:
+                candidate_keys.extend(
+                    [
+                        f"{field_name}_{alias}",
+                        f"name_{alias}",
+                        f"title_{alias}",
+                    ]
+                )
+        candidate_keys.extend(aliases)
+        candidate_keys.extend(["name", "title", "label", "value", "text", "english", "japanese", "romaji"])
+
+        for key in candidate_keys:
+            if key in value:
+                resolved = self._coerce_text(value.get(key), "")
+                if resolved:
+                    return resolved
+
+        for candidate in value.values():
+            resolved = self._coerce_text(candidate, "")
+            if resolved:
+                return resolved
+        return ""
+
+    def _resolve_translated_book_field(
+        self,
+        metadata_translated: dict,
+        target_language: str,
+        field_name: str,
+        jp_fallback: str,
+    ) -> str:
+        """
+        Resolve book-level metadata field (author/publisher/series) with broad fallbacks.
+        """
+        field_key = f"{field_name}_{target_language}"
+        official_localization = metadata_translated.get("official_localization", {})
+        official_value = ""
+        if isinstance(official_localization, dict):
+            official_value = self._coerce_text(
+                official_localization.get(field_key)
+                or official_localization.get(f"{field_name}_en"),
+                "",
+            )
+
+        nested_value = self._extract_localized_field(
+            metadata_translated.get(field_name),
+            target_language,
+            field_name,
+        )
+
+        return self._coerce_text(
+            metadata_translated.get(field_key)
+            or nested_value
+            or metadata_translated.get(f"{field_name}_en")
+            or official_value
+            or jp_fallback,
+            "",
+        )
+
+    def build_epub(
+        self,
+        volume_id: str,
+        output_filename: Optional[str] = None,
+        skip_qc_check: bool = False,
+        include_header_illustrations: bool = False,
+        dry_run: bool = False,
+        emit_xtc: Optional[str] = None,
+    ) -> BuildResult:
+        """
+        Build complete EPUB from translated volume.
+
+        Args:
+            volume_id: Volume identifier (directory name in WORK/)
+            output_filename: Optional custom output filename
+            skip_qc_check: If True, build even if critics not complete
+            include_header_illustrations: If True, preserve chapter-opening
+                illustration placeholders in chapter XHTML instead of skipping them
+            dry_run: Developer flag, the build-side counterpart to Translator's
+                dry_run (src/translator/dry_run.py). Runs every assembly step
+                (chapters, images, nav, OPF) into the temp build directory as
+                normal, then instead of packaging a .epub and writing OUTPUT/,
+                copies that assembled OEBPS/ tree to
+                WORK/<volume_id>/DRY_RUN/<run-stamp>/BUILD/ for inspection.
+                No .epub is produced and manifest.json is not touched.
+
+        Returns:
+            BuildResult with status and details
+        """
+        print(f"\n{'='*60}")
+        print(f"BUILDER AGENT - Building: {volume_id}")
+        print(f"Target Language: {self.language_name} ({self.target_language.upper()})")
+        print(f"Device Profile: {describe_profile(self.profile)}")
+
+        # Auto-detect header illustrations if not explicitly provided
+        detected_headers: List[Dict[str, str]] = []
+        if not include_header_illustrations:
+            print("\n[DEBUG] Auto-detecting header illustrations...")
+            detected_headers = self.detect_header_illustrations(volume_id)
+            if detected_headers:
+                include_header_illustrations = True
+                print(f"     [AUTO] Detected {len(detected_headers)} chapter header illustration(s) - enabling")
+                for h in detected_headers:
+                    print(f"          - {h.get('chapter_id')}: {h.get('placeholder')}")
+            else:
+                print("     [AUTO] No header illustrations detected")
+        elif include_header_illustrations:
+            # If explicitly enabled, still detect to get the placeholder info
+            detected_headers = self.detect_header_illustrations(volume_id)
+
+        print(
+            "Header illustrations: "
+            + ("INCLUDE" if include_header_illustrations else "SKIP")
+        )
+        print(f"{'='*60}\n")
+
+        try:
+            # Step 1: Load and validate manifest
+            print("[STEP 1/8] Loading manifest...")
+            work_dir = self.work_base / volume_id
+            manifest = self._load_manifest(work_dir)
+
+            # Determine target language from manifest (overrides global config):
+            # the translator's stamp, else the language the Librarian bound the
+            # workspace to at extraction.
+            manifest_target_lang = (
+                manifest.get('pipeline_state', {}).get('translator', {}).get('target_language')
+                or (manifest.get('runtime_config') or {}).get('target_language')
+            )
+            if manifest_target_lang:
+                # Use the language from when this volume was translated
+                actual_target_lang = manifest_target_lang
+                actual_lang_config = get_language_config(actual_target_lang)
+                actual_language_name = actual_lang_config.get('language_name', actual_target_lang.upper())
+                actual_language_code = actual_lang_config.get('language_code', actual_target_lang)
+                actual_output_suffix = actual_lang_config.get('output_suffix', f'_{actual_target_lang.upper()}')
+                
+                if actual_target_lang != self.target_language:
+                    print(f"     [INFO] Volume was translated to {actual_target_lang.upper()}, using that language config")
+                    print(f"            (Current global config is {self.target_language.upper()})")
+            else:
+                # Fallback to global config (backward compatibility for old manifests)
+                print(f"     [WARNING] No target_language in manifest, using global config: {self.target_language.upper()}")
+                actual_target_lang = self.target_language
+                actual_lang_config = self.lang_config
+                actual_language_name = self.language_name
+                actual_language_code = self.language_code
+                actual_output_suffix = self.output_suffix
+
+            if not skip_qc_check:
+                self._validate_pipeline_state(manifest)
+
+            if actual_target_lang != 'en':
+                # In memory only: a non-English book must not fall back to
+                # metadata_en (an English title on a Vietnamese EPUB).
+                from src.Deepseek.common.language import localized_manifest_metadata
+
+                localized = localized_manifest_metadata(work_dir, actual_target_lang, manifest)
+                if localized:
+                    manifest[f'metadata_{actual_target_lang}'] = localized
+
+            manifest = self._run_spine_merge_preflight(
+                manifest=manifest,
+                work_dir=work_dir,
+                target_language=actual_target_lang,
+            )
+
+            metadata_jp = manifest.get('metadata', {})
+            # Get language-specific metadata using actual target language
+            metadata_key = f'metadata_{actual_target_lang}'
+            metadata_translated = manifest.get(metadata_key) or manifest.get('metadata_en', {})
+            
+            # Support both v3.0 and v3.5 manifest schemas
+            chapters = manifest.get('chapters', [])
+            if not chapters and 'structure' in manifest:
+                # v3.5 schema: chapters are in structure.chapters
+                chapters = manifest.get('structure', {}).get('chapters', [])
+
+            # Get title in actual target language
+            # Support v3.0, v3.5, v3.6, and v3.7 schemas
+            title_key = f'title_{actual_target_lang}'
+            series_data = metadata_jp.get('series', {})
+            # v3.7 format: check for title_english/title_japanese directly first
+            if isinstance(series_data, dict) and 'title_english' in series_data:
+                if actual_target_lang == 'en':
+                    book_title = series_data.get('title_english') or series_data.get('title_romaji') or 'Unknown'
+                else:
+                    book_title = series_data.get(f'title_{actual_target_lang}') or series_data.get('title_english') or 'Unknown'
+            elif isinstance(series_data, dict) and 'title' in series_data:
+                series_title = series_data.get('title', {})
+                if isinstance(series_title, dict):
+                    # v3.5 schema: title is nested dict (title.english, title.romaji)
+                    if actual_target_lang == 'en':
+                        book_title = series_title.get('english') or series_title.get('romaji') or 'Unknown'
+                    else:
+                        book_title = series_title.get(actual_target_lang) or series_title.get('english') or series_title.get('romaji') or 'Unknown'
+                else:
+                    # v3.6 schema: title is string
+                    book_title = series_data.get('title') or 'Unknown'
+            else:
+                # v3.0 schema or fallback
+                # Check metadata_translated first, then official localization, then fall back to Japanese
+                book_title = self._resolve_book_title(
+                    manifest=manifest,
+                    metadata_jp=metadata_jp,
+                    metadata_translated=metadata_translated,
+                    target_language=actual_target_lang,
+                    fallback="Unknown",
+                )
+            book_title = self._coerce_text(book_title, "Unknown")
+            print(f"     Title: {book_title}")
+            print(f"     Target Language: {actual_language_name}")
+            print(f"     Chapters: {len(chapters)}")
+
+            # Detect multi-act structure
+            volume_structure = manifest.get('volume_structure', {})
+            volume_acts = volume_structure.get('acts', [])
+            is_multi_act = volume_structure.get('is_multi_act', False) and len(volume_acts) >= 2
+            if is_multi_act:
+                print(f"     [MULTI-ACT] {len(volume_acts)} acts detected")
+                for act in volume_acts:
+                    act_label = self._coerce_text(
+                        act.get('title_en') or act.get('title', ''),
+                        f"Act {act.get('act_number', '')}"
+                    )
+                    print(f"       Act {act['act_number']}: {act_label}")
+
+            # Step 2: Create build directory
+            print("\n[STEP 2/8] Creating EPUB structure...")
+            build_dir = Path(tempfile.mkdtemp(prefix='epub_build_', dir=OS_PATHS.get("temp_dir")))
+            paths = create_epub_structure(build_dir)
+            print(f"     Build dir: {build_dir}")
+
+            # Step 3: Convert chapters
+            print("\n[STEP 3/8] Converting chapters to XHTML...")
+            chapter_items, chapter_info = self._process_chapters(
+                manifest,
+                work_dir,
+                paths,
+                actual_target_lang,
+                include_header_illustrations=include_header_illustrations,
+                detected_headers=detected_headers,
+            )
+            print(f"     Converted: {len(chapter_items)} chapters")
+
+            # Step 4: Process images
+            print("\n[STEP 4/8] Processing images...")
+            (
+                image_items,
+                kuchie_metadata,
+                renamed_images,
+                image_results,
+            ) = self._process_images(manifest, work_dir, paths)
+            print(f"     Emitted: {len(image_items)} images")
+
+            # Step 5: Generate frontmatter
+            print("\n[STEP 5/8] Generating frontmatter...")
+            frontmatter_items = self._generate_frontmatter(manifest, paths, chapter_info, kuchie_metadata, actual_language_code, actual_lang_config, actual_target_lang)
+            print(f"     Generated: cover, kuchi-e, TOC pages")
+
+            # Step 5.5: Generate act interstitials (separators + per-act kuchie) for multi-act
+            act_items = []
+            if is_multi_act:
+                print("\n[STEP 5.5/8] Generating act interstitials...")
+                act_items = self._generate_act_interstitials(
+                    manifest, paths, chapter_info, kuchie_metadata,
+                    actual_language_code, actual_lang_config, actual_target_lang
+                )
+                print(f"     Generated: {len(act_items)} act separator/kuchie pages")
+
+            # Step 6: Generate navigation
+            print("\n[STEP 6/8] Generating navigation...")
+            nav_items = self._generate_navigation(manifest, paths, chapter_info, actual_language_code, actual_lang_config, actual_target_lang)
+            print(f"     Generated: nav.xhtml, toc.ncx")
+
+            # Step 6.5: Fix up image references if any file was transcoded.
+            # Deliberately after every XHTML producer (chapters, frontmatter,
+            # act interstitials, nav) so nothing is left pointing at a filename
+            # that stopped existing during the image pass.
+            self._apply_image_renames(paths, renamed_images)
+
+            # Step 7: Generate CSS
+            print("\n[STEP 7/8] Creating stylesheet...")
+            css_items = self._create_stylesheet(paths, actual_target_lang)
+            print(f"     Created: stylesheet.css")
+
+            # Device budget audit. Warn-only by design: a book that opens
+            # slowly should say so at build time, not fail the build.
+            build_warnings: List[str] = []
+            if self.profile.budgets:
+                collected: List[str] = []
+                collected.extend(
+                    device_budgets.audit_chapters(paths.text_dir, self.profile.budgets)
+                )
+                collected.extend(
+                    device_budgets.audit_images(image_results, self.profile)
+                )
+                collected.extend(
+                    device_budgets.audit_stylesheet(
+                        STYLESHEETS.get(self.profile.stylesheet, DEFAULT_CSS)
+                    )
+                )
+                build_warnings = device_budgets.report(
+                    collected, header=f"{self.profile.name} budget"
+                )
+
+            # Step 8: Generate OPF and package
+            print("\n[STEP 8/8] Generating OPF and packaging...")
+            all_items = nav_items + css_items + frontmatter_items + act_items + chapter_items + image_items
+
+            # Find cover image ID
+            # Prioritize exact match for 'cover-image' to avoid matching 'allcover' first
+            cover_image_id = None
+            for item in image_items:
+                if item.id == 'cover-image':
+                    cover_image_id = item.id
+                    break
+            # Fallback: accept any ID containing 'cover' (but not 'allcover')
+            if not cover_image_id:
+                for item in image_items:
+                    if 'cover' in item.id.lower() and 'allcover' not in item.id.lower():
+                        cover_image_id = item.id
+                        break
+            # Second fallback: use first kuchie image as cover if no cover found
+            if not cover_image_id:
+                for item in image_items:
+                    if item.id.startswith('kuchie-img-'):
+                        cover_image_id = item.id
+                        print(f"     [COVER] Using kuchie as cover: {item.id}")
+                        break
+
+            self._generate_opf(manifest, work_dir, paths, all_items, chapter_info, cover_image_id, actual_language_code)
+
+            if dry_run:
+                debug_dir = self._write_dry_run_build(work_dir, build_dir)
+                dir_size_mb = self._dir_size_mb(debug_dir)
+                shutil.rmtree(build_dir, ignore_errors=True)
+
+                print(f"\n{'='*60}")
+                print("DRY RUN COMPLETE — no .epub packaged, manifest.json untouched")
+                print(f"{'='*60}")
+                print(f"Assembled structure: {debug_dir}")
+                print(f"Size:     {dir_size_mb:.2f} MB")
+                print(f"Chapters: {len(chapter_items)}")
+                print(f"Images:   {len(image_items)}")
+                print(f"{'='*60}\n")
+
+                return BuildResult(
+                    success=True,
+                    output_path=None,
+                    file_size_mb=dir_size_mb,
+                    chapter_count=len(chapter_items),
+                    image_count=len(image_items),
+                    warnings=build_warnings,
+                    dry_run=True,
+                    debug_dir=debug_dir,
+                )
+
+            # Generate output filename
+            if output_filename is None:
+                # Use translated title for filename if available
+                title_for_filename = book_title or metadata_jp.get('title', volume_id)
+                # Clean filename
+                safe_title = "".join(c for c in title_for_filename if c.isalnum() or c in ' -_').strip()
+                safe_title = safe_title[:50]  # Limit length
+                output_filename = f"{safe_title}{actual_output_suffix}.epub"
+
+            output_path = self.output_base / output_filename
+
+            # Package EPUB
+            EPUBPackager.package_epub(build_dir, output_path)
+
+            # Validate
+            EPUBPackager.validate_epub_structure(output_path)
+
+            # Get file size
+            file_size_mb = output_path.stat().st_size / (1024 * 1024)
+
+            # Optional XTC/XTCH companion. Additive and non-fatal by contract:
+            # the .epub above is the deliverable and stands on its own, so a
+            # failed render is a warning, never a failed build.
+            xtc_path: Optional[Path] = None
+            xtc_ok: Optional[bool] = None
+            if emit_xtc:
+                print(f"\n[XTC] Rendering {emit_xtc} for profile {self.profile.name}...")
+                xtc_cfg = get_xtc_config()
+                xtc_cfg['format'] = emit_xtc
+                xtc_result = export_xtc(
+                    output_path, self.profile, xtc_cfg, output_dir=self.output_base
+                )
+                xtc_ok = xtc_result.ok
+                if xtc_result.ok and xtc_result.output_path:
+                    xtc_path = xtc_result.output_path
+                    print(
+                        f"     [OK] {xtc_path.name}: "
+                        f"{xtc_result.size_bytes / 1024 / 1024:.1f} MB, "
+                        f"{xtc_result.page_count} pages"
+                    )
+                    build_warnings.extend(f"xtc: {w}" for w in xtc_result.warnings)
+                else:
+                    print(f"     [WARN] XTC export failed: {xtc_result.error}")
+                    build_warnings.append(f"xtc export failed: {xtc_result.error}")
+
+            # Update manifest
+            self._update_manifest(work_dir, output_filename, len(chapter_items), len(image_items))
+
+            # Cleanup
+            shutil.rmtree(build_dir, ignore_errors=True)
+
+            # Summary
+            print(f"\n{'='*60}")
+            print("BUILD COMPLETE")
+            print(f"{'='*60}")
+            print(f"Output: {output_path}")
+            print(f"Size:   {file_size_mb:.2f} MB")
+            print(f"Chapters: {len(chapter_items)}")
+            print(f"Images: {len(image_items)}")
+            print(f"Profile: {self.profile.name}")
+            if xtc_path:
+                print(f"XTC:    {xtc_path.name}")
+            elif xtc_ok is False:
+                print("XTC:    export failed (see warnings above; .epub is unaffected)")
+            print(f"{'='*60}\n")
+
+            return BuildResult(
+                success=True,
+                output_path=output_path,
+                file_size_mb=file_size_mb,
+                chapter_count=len(chapter_items),
+                image_count=len(image_items),
+                warnings=build_warnings,
+                xtc_path=xtc_path,
+                xtc_ok=xtc_ok,
+            )
+
+        except Exception as e:
+            import traceback
+            print(f"\n[ERROR] Build failed: {e}")
+            print("\n[DEBUG] Full traceback:")
+            traceback.print_exc()
+            return BuildResult(
+                success=False,
+                output_path=None,
+                error=str(e)
+            )
+
+    def _load_volume_identity(self, work_dir: Path) -> Dict[str, Any]:
+        """
+        Load OPF-level book metadata from context.xml's <volume_identity>
+        block — title_en, series_en, author_en, publisher. This is the
+        block DeepSeek prep actually writes to; manifest.json's
+        metadata/metadata_en keys are, at best, a partial mirror of it
+        (prep never even copies series_en there) and are not read here.
+
+        Hard failure by design: no Japanese fallback and no placeholder
+        text. A missing context.xml or an empty required field means prep
+        hasn't produced usable metadata for this volume, and the build
+        should stop rather than ship an EPUB titled "Unknown".
+        """
+        context_path = work_dir / "context.xml"
+        if not context_path.exists():
+            raise FileNotFoundError(
+                f"context.xml not found: {context_path} — run prep before build; "
+                "OPF metadata no longer falls back to manifest.json"
+            )
+
+        context_xml = context_path.read_text(encoding="utf-8")
+        try:
+            root = ET.fromstring(context_xml)
+        except ET.ParseError as exc:
+            repaired_context_xml = _escape_legacy_bare_ampersands(context_xml)
+            if repaired_context_xml == context_xml:
+                raise ValueError(f"context.xml at {context_path} is not valid XML: {exc}") from exc
+
+            try:
+                root = ET.fromstring(repaired_context_xml)
+            except ET.ParseError:
+                raise ValueError(f"context.xml at {context_path} is not valid XML: {exc}") from exc
+
+            atomic_write_text(context_path, repaired_context_xml)
+            print(
+                "     [REPAIR] Escaped legacy bare ampersand(s) in context.xml "
+                "and revalidated the complete document"
+            )
+
+        verse_type = set_verse_epub_type(_resolve_verse_epub_type(root))
+        if verse_type != "z3998:poem":
+            print(f"     Verse containers marked as {verse_type}")
+
+        volume_identity = root.find("volume_identity")
+        if volume_identity is None:
+            raise ValueError(f"context.xml at {context_path} has no <volume_identity> block")
+
+        from src.Deepseek.common.language import localized_volume_identity
+
+        localized_identity = localized_volume_identity(work_dir, volume_identity)
+        resolved: Dict[str, Any] = {}
+        for field_name in _REQUIRED_VOLUME_IDENTITY_FIELDS:
+            if localized_identity.get(field_name):
+                resolved[field_name] = localized_identity[field_name]
+                continue
+            text = ""
+            for candidate_name in _VOLUME_IDENTITY_FIELD_ALIASES.get(field_name, (field_name,)):
+                node = volume_identity.find(candidate_name)
+                text = (node.text or "").strip() if node is not None else ""
+                if text:
+                    break
+            if not text and field_name == "publisher":
+                # Web novels have no publisher; the site that hosts them is
+                # the honest value (not a guess).
+                text = _web_import_publisher(work_dir)
+            if not text:
+                raise ValueError(
+                    f"context.xml <volume_identity>/<{field_name}> is missing or empty at "
+                    f"{context_path} — prep must populate this before build can run"
+                )
+            resolved[field_name] = text
+
+        # volume_number backs series_index (OPF <meta name="calibre:series_index">),
+        # which the user's spec didn't name as a required field — parse it on a
+        # best-effort basis rather than hard-failing the whole build over it.
+        volume_number_node = volume_identity.find("volume_number")
+        volume_number_text = (volume_number_node.text or "").strip() if volume_number_node is not None else ""
+        try:
+            resolved["volume_number"] = int(volume_number_text) if volume_number_text else None
+        except ValueError:
+            resolved["volume_number"] = None
+
+        return resolved
+
+    def _extract_chapter_h1_title(self, md_content: str, source_label: str) -> str:
+        """
+        The chapter's EN title is the leading '# Title' line DeepSeek now
+        emits at the top of every translated chapter, not a manifest.json
+        chapter field. Leading blank lines are tolerated, and so are leading
+        '## TITLE CORRECTION: ...' annotation lines (see
+        _TITLE_CORRECTION_ANNOTATION_RE) — those are prep/QC scratch notes
+        left above the real, already-corrected H1, not chapter content, and
+        are discarded so the scan continues to the actual title beneath them.
+        Once any other real body content starts, a later '#' is body text,
+        not a title marker.
+
+        Hard failure by design: no Japanese fallback and no "Chapter N"
+        placeholder. A missing H1 means the translated output is malformed
+        and the build should stop, not silently mislabel the chapter.
+        """
+        for line in md_content.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _TITLE_CORRECTION_ANNOTATION_RE.match(stripped):
+                continue
+            match = _CHAPTER_H1_RE.match(stripped)
+            if not match:
+                break
+            title = match.group(1).strip()
+            if title:
+                return title
+            break
+
+        raise ValueError(
+            f"{source_label}: no leading H1 chapter title ('# Title') found in the "
+            "translated markdown — required now that chapter titles come from EN "
+            "output instead of manifest.json"
+        )
+
+    def _normalize_chapter_title(self, title: str) -> str:
+        """Strip a spurious 'Chapter NN: ' prefix glued onto a differently-typed section."""
+        return _MISLABELED_CHAPTER_PREFIX_RE.sub('', title, count=1)
+
+    def _load_manifest(self, work_dir: Path) -> dict:
+        """Load manifest.json from work directory."""
+        manifest_path = work_dir / "manifest.json"
+
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _write_dry_run_build(self, work_dir: Path, build_dir: Path) -> Path:
+        """
+        Copy the fully-assembled but unpackaged EPUB tree out of the temp
+        build directory into a durable, inspectable location — mirrors
+        Translator dry-run's WORK/<volume_id>/DRY_RUN/ convention
+        (src/translator/dry_run.py) so both phases' dry-run artifacts live
+        in the same place. Run-stamped per invocation since one build_epub()
+        call only ever produces one build, unlike Translator's per-chapter
+        cache reuse within a run.
+        """
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(2)
+        debug_dir = work_dir / "DRY_RUN" / stamp / "BUILD"
+        shutil.copytree(build_dir, debug_dir)
+        return debug_dir
+
+    @staticmethod
+    def _dir_size_mb(path: Path) -> float:
+        """Total size in MB of every file under *path*, recursively."""
+        total_bytes = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+        return total_bytes / (1024 * 1024)
+
+    @staticmethod
+    def _extract_chapter_opening_illustration(md_content: str) -> Optional[str]:
+        """Return the first chapter-opening illustration placeholder, if present."""
+        from src.Deepseek.common.config import ILLUSTRATION_PLACEHOLDER_PATTERN
+
+        content_started = False
+        for raw_line in md_content.splitlines():
+            line = raw_line.strip()
+            if line.startswith('#'):
+                continue
+            if not line:
+                continue
+
+            is_illustration = bool(re.search(ILLUSTRATION_PLACEHOLDER_PATTERN, line))
+            if is_illustration and not content_started:
+                return line
+
+            if line != "<blank>":
+                content_started = True
+                break
+
+        return None
+
+    def _resolve_chapter_markdown_path_silent(
+        self,
+        chapter: dict,
+        translated_dir: Path,
+        jp_dir: Path,
+        target_language: str
+    ) -> Optional[Path]:
+        """Resolve translated markdown path without emitting builder logs."""
+        source_file = self._coerce_text(chapter.get('source_file', ''), '')
+        if not source_file:
+            return None
+
+        lang_file_key = f'{target_language}_file'
+        translated_filename_raw = chapter.get(lang_file_key) or chapter.get('translated_file', source_file)
+        translated_filename = self._coerce_text(translated_filename_raw, source_file)
+        translated_file = translated_dir / translated_filename
+        jp_file = jp_dir / source_file
+
+        if translated_file.exists():
+            return translated_file
+        if jp_file.exists():
+            return jp_file
+
+        mapped_id = self._map_filename_to_chapter_id(source_file)
+        if mapped_id != source_file:
+            translated_file_mapped = translated_dir / f"{mapped_id}.md"
+            if translated_file_mapped.exists():
+                return translated_file_mapped
+
+        return None
+
+    def detect_header_illustrations(self, volume_id: str) -> List[Dict[str, str]]:
+        """
+        Detect chapter-opening illustration placeholders for a volume.
+
+        Returns:
+            List of dicts with chapter/file/placeholder metadata.
+        """
+        work_dir = self.work_base / volume_id
+        manifest = self._load_manifest(work_dir)
+
+        manifest_target_lang = manifest.get('pipeline_state', {}).get('translator', {}).get('target_language')
+        actual_target_lang = self._coerce_text(manifest_target_lang, self.target_language).lower()
+
+        chapters = manifest.get('chapters', [])
+        if not chapters and 'structure' in manifest:
+            chapters = manifest.get('structure', {}).get('chapters', [])
+
+        translated_dir = work_dir / actual_target_lang.upper()
+        jp_dir = work_dir / "JP"
+
+        detections: List[Dict[str, str]] = []
+        for index, chapter in enumerate(chapters, start=1):
+            md_path = self._resolve_chapter_markdown_path_silent(
+                chapter=chapter,
+                translated_dir=translated_dir,
+                jp_dir=jp_dir,
+                target_language=actual_target_lang,
+            )
+            if md_path is None or not md_path.exists():
+                continue
+
+            try:
+                placeholder = self._extract_chapter_opening_illustration(
+                    md_path.read_text(encoding='utf-8')
+                )
+            except Exception:
+                continue
+
+            if not placeholder:
+                continue
+
+            chapter_id = self._coerce_text(
+                chapter.get('id', f'chapter_{index:02d}'),
+                f'chapter_{index:02d}',
+            )
+            detections.append({
+                "chapter_id": chapter_id,
+                "file": md_path.name,
+                "placeholder": placeholder,
+            })
+
+        return detections
+
+    def _validate_pipeline_state(self, manifest: dict) -> None:
+        """Validate that previous pipeline stages are complete."""
+        state = manifest.get('pipeline_state', {})
+
+        # Check librarian
+        librarian = state.get('librarian', {})
+        if librarian.get('status') != 'completed':
+            raise ValueError("Librarian stage not completed")
+
+        # Check translator
+        translator = state.get('translator', {})
+        if translator.get('status') != 'completed':
+            # Allow if at least some chapters translated
+            if translator.get('chapters_completed', 0) == 0:
+                raise ValueError("No chapters translated yet")
+            print("     [WARNING] Translator not fully complete, building available chapters")
+
+    def _run_spine_merge_preflight(
+        self,
+        manifest: dict,
+        work_dir: Path,
+        target_language: str
+    ) -> dict:
+        """
+        Preflight: merge fragmented translated shards into canonical spine groups.
+
+        Returns an in-memory manifest override. This does not mutate manifest.json.
+        """
+        try:
+            merged_manifest, diagnostics = merge_translated_shards_to_spine(
+                work_dir=work_dir,
+                manifest=manifest,
+                target_language=target_language,
+                apply_manifest=False,
+            )
+        except Exception as e:
+            print(f"     [WARNING] Spine merge preflight failed: {e}")
+            return manifest
+
+        if not diagnostics.get("applied"):
+            reason = self._coerce_text(diagnostics.get("reason"), "not_applicable")
+            print(f"     [INFO] Spine merge preflight skipped: {reason}")
+            return manifest
+
+        print(
+            "     [INFO] Spine merge preflight applied: "
+            f"{diagnostics.get('source_chapters', 0)} -> "
+            f"{diagnostics.get('canonical_chapters', 0)} chapters"
+        )
+        map_path = self._coerce_text(diagnostics.get("map_path"), "")
+        if map_path:
+            print(f"            Map: {map_path}")
+        return merged_manifest
+
+    def _process_chapters(
+        self,
+        manifest: dict,
+        work_dir: Path,
+        paths: EPUBPaths,
+        target_language: str,
+        include_header_illustrations: bool = False,
+        detected_headers: List[Dict[str, str]] = None,
+    ) -> tuple:
+        """Convert all translated markdown chapters to XHTML."""
+        # Support both v3.0 and v3.5 manifest schemas
+        chapters = manifest.get('chapters', [])
+        if not chapters and 'structure' in manifest:
+            # v3.5 schema: chapters are in structure.chapters
+            chapters = manifest.get('structure', {}).get('chapters', [])
+        metadata_jp = manifest.get('metadata', {})
+        # Get language-specific metadata
+        metadata_key = f'metadata_{target_language}'
+        metadata_translated = manifest.get(metadata_key) or manifest.get('metadata_en', {})
+        book_title = self._resolve_book_title(
+            manifest=manifest,
+            metadata_jp=metadata_jp,
+            metadata_translated=metadata_translated,
+            target_language=target_language,
+            fallback="Unknown",
+        )
+        lang_config = get_language_config(target_language)
+        lang_code = lang_config.get('language_code', target_language)
+
+        # Sort chapters by toc_order to preserve canonical sequence
+        # Fallback to original order if toc_order not present
+        chapters = sorted(chapters, key=lambda ch: ch.get('toc_order', 999))
+
+        # Language-specific translated directory (e.g., EN/, VN/)
+        translated_dir = work_dir / target_language.upper()
+        jp_dir = work_dir / "JP"  # Fallback if translated dir not available
+
+        manifest_items = []
+        chapter_info = []  # For navigation
+
+        merge_enabled, merge_diag = self._should_merge_split_chapters_to_raw_structure(
+            manifest, work_dir, chapters
+        )
+        if merge_enabled:
+            chapter_batches = self._group_chapters_by_raw_group_index(chapters)
+            print(
+                "     [INFO] Raw-structure merge enabled: "
+                f"{len(chapters)} translated chapters -> {len(chapter_batches)} EPUB chapters"
+            )
+        else:
+            chapter_batches = [[chapter] for chapter in chapters]
+            if any(ch.get('split_strategy') == 'text_page_boundary' for ch in chapters):
+                reason = self._coerce_text(merge_diag.get("reason"), "raw structure not verified")
+                print(
+                    "     [INFO] Detected text-page split chapters but raw-structure merge is disabled "
+                    f"({reason}); keeping per-chapter EPUB layout."
+                )
+
+        # Create header lookup from detected_headers (auto-detected in build_epub)
+        header_lookup: Dict[str, str] = {}
+        if detected_headers:
+            for h in detected_headers:
+                ch_id = h.get('chapter_id', '')
+                placeholder = h.get('placeholder', '')
+                if ch_id and placeholder:
+                    header_lookup[ch_id] = placeholder
+        print(f"     [DEBUG] Header lookup: {header_lookup}")
+
+        for i, batch in enumerate(chapter_batches):
+            primary = batch[0]
+            chapter_id = self._coerce_text(primary.get('id', f'chapter_{i+1:02d}'), f'chapter_{i+1:02d}')
+            source_file = self._coerce_text(primary.get('source_file', ''), '')
+
+            # Skip non-content entries (cover/kuchie placeholders)
+            if not source_file:
+                continue
+
+            merged_markdown_chunks: List[str] = []
+            merged_source_files: List[str] = []
+            for chapter in batch:
+                md_path = self._resolve_chapter_markdown_path(
+                    chapter=chapter,
+                    translated_dir=translated_dir,
+                    jp_dir=jp_dir,
+                    target_language=target_language,
+                )
+                if md_path is None:
+                    continue
+                merged_markdown_chunks.append(md_path.read_text(encoding='utf-8'))
+                merged_source_files.append(self._coerce_text(chapter.get('source_file', ''), ''))
+
+            if not merged_markdown_chunks:
+                print(f"     [SKIP] No markdown content resolved for chapter batch {i+1}")
+                continue
+
+            md_content = '\n\n'.join(chunk for chunk in merged_markdown_chunks if chunk)
+
+            # Chapter title comes from the translated output itself, not
+            # manifest.json — DeepSeek now emits a consistent leading H1 on
+            # every chapter, so that line is the title.
+            title = self._extract_chapter_h1_title(
+                md_content, source_label=f"{chapter_id} ({source_file or 'merged batch'})"
+            )
+            title = self._normalize_chapter_title(title)
+
+            # Use pre-detected header from lookup (auto-detected in build_epub)
+            # Fall back to extraction only if no pre-detected headers provided
+            print(f"     [DEBUG] Processing chapter {i+1}: chapter_id={chapter_id}")
+            print(f"     [DEBUG] header_lookup={header_lookup}")
+            print(f"     [DEBUG] include_header_illustrations={include_header_illustrations}")
+
+            if header_lookup:
+                header_illustration_placeholder = header_lookup.get(chapter_id, '')
+                header_illustration_active = bool(header_illustration_placeholder)
+                print(f"     [DEBUG] Using header_lookup: placeholder={header_illustration_placeholder}, active={header_illustration_active}")
+            else:
+                # Legacy path: extract from content
+                header_illustration_placeholder = None
+                if include_header_illustrations:
+                    header_illustration_placeholder = self._extract_chapter_opening_illustration(md_content)
+                    header_illustration_active = bool(header_illustration_placeholder)
+                    print(f"     [DEBUG] Legacy extraction: placeholder={header_illustration_placeholder}")
+                else:
+                    header_illustration_active = False
+                    print(f"     [DEBUG] No header illustrations")
+
+            # Remove illustration placeholder from markdown content if we're using it
+            if header_illustration_active and header_illustration_placeholder:
+                md_content_lines = md_content.split('\n')
+                md_content = '\n'.join(
+                    line for line in md_content_lines
+                    if header_illustration_placeholder.strip() not in line
+                )
+
+            # Convert to XHTML paragraphs (header illustration already removed from md_content)
+            paragraphs = self._markdown_to_paragraphs(
+                md_content,
+                include_header_illustrations=False,  # Already extracted
+            )
+            xhtml_content = MarkdownToXHTML.convert_to_xhtml_string(paragraphs)
+            if target_language != 'en':
+                xhtml_content = mark_dialogue_paragraphs(xhtml_content)
+
+            # Generate separate decorated header xhtml BEFORE chapter xhtml if enabled
+            if header_illustration_active and header_illustration_placeholder:
+                # Extract image filename from placeholder: [ILLUSTRATION: pxxx.jpg]
+                from src.Deepseek.common.config import ILLUSTRATION_PLACEHOLDER_PATTERN
+                match = re.search(ILLUSTRATION_PLACEHOLDER_PATTERN, header_illustration_placeholder)
+                if match:
+                    header_image_file = match.group(1).strip().strip('"')
+                    header_xhtml_filename = f"chapter{i+1:03d}-header.xhtml"
+                    header_xhtml_path = paths.text_dir / header_xhtml_filename
+
+                    # Use StructureBuilder to create the header page
+                    header_id = f"chapter-{i+1:03d}-header"
+                    StructureBuilder.create_image_page_xhtml(
+                        header_xhtml_path,
+                        header_image_file,
+                        header_id,
+                        title,
+                        lang_code,
+                        "header-illustration"
+                    )
+
+                    # Add to manifest BEFORE the chapter
+                    manifest_items.append(ManifestItem(
+                        id=header_id,
+                        href=f"Text/{header_xhtml_filename}",
+                        media_type="application/xhtml+xml"
+                    ))
+                    print(f"     [OK] Generated decorated header: {header_xhtml_filename}")
+
+            # Build XHTML
+            xhtml_filename = f"chapter{i+1:03d}.xhtml"
+            xhtml_path = paths.text_dir / xhtml_filename
+
+            # Pre-TOC content: suppress title header to match original formatting
+            chapter_title_for_xhtml = title
+            if primary.get('is_pre_toc_content', False):
+                chapter_title_for_xhtml = ""  # No H1 header for unlisted content
+                print(f"     [INFO] Pre-TOC content: suppressing title header")
+
+            xhtml = XHTMLBuilder.build_chapter_xhtml(
+                content=xhtml_content,
+                chapter_title=chapter_title_for_xhtml,
+                chapter_id=chapter_id,
+                lang_code=lang_code,
+                book_title=book_title,
+                place_title_after_leading_illustration=(
+                    header_illustration_active and bool(chapter_title_for_xhtml)
+                ),
+            )
+            xhtml_path.write_text(xhtml, encoding='utf-8')
+
+            # Add to manifest
+            manifest_items.append(ManifestItem(
+                id=chapter_id,
+                href=f"Text/{xhtml_filename}",
+                media_type="application/xhtml+xml"
+            ))
+
+            # Track every chapter for navigation. Pre-TOC content (front
+            # plates, premise pages, etc.) must still render in the spine, but
+            # is excluded from the table of contents / nav listing. Tag it so
+            # the spine and navigation generators can tell the two apart.
+            chapter_entry = {
+                'id': chapter_id,
+                'title': title,
+                'xhtml_filename': xhtml_filename,
+                'href': f"Text/{xhtml_filename}",
+            }
+            if primary.get('is_pre_toc_content', False):
+                chapter_entry['pre_toc'] = True
+            # Add header illustration ID if present (for spine ordering)
+            if header_illustration_active and header_illustration_placeholder:
+                from src.Deepseek.common.config import ILLUSTRATION_PLACEHOLDER_PATTERN
+                match = re.search(ILLUSTRATION_PLACEHOLDER_PATTERN, header_illustration_placeholder)
+                if match:
+                    chapter_entry['header_id'] = f"chapter-{i+1:03d}-header"
+            chapter_info.append(chapter_entry)
+
+            if len(batch) > 1:
+                merged_count = len([f for f in merged_source_files if f])
+                print(
+                    f"     [OK] merged {merged_count} source chapters "
+                    f"(raw_group={primary.get('raw_group_index')}) -> {xhtml_filename}"
+                )
+            else:
+                print(f"     [OK] {source_file} -> {xhtml_filename}")
+
+        return manifest_items, chapter_info
+
+    def _resolve_chapter_markdown_path(
+        self,
+        chapter: dict,
+        translated_dir: Path,
+        jp_dir: Path,
+        target_language: str
+    ) -> Optional[Path]:
+        """Resolve translated markdown path for one manifest chapter entry."""
+        source_file = self._coerce_text(chapter.get('source_file', ''), '')
+        if not source_file:
+            return None
+
+        # Look for translated file in language-specific dir first, then fallback.
+        lang_file_key = f'{target_language}_file'
+        translated_filename_raw = chapter.get(lang_file_key) or chapter.get('translated_file', source_file)
+        translated_filename = self._coerce_text(translated_filename_raw, source_file)
+        translated_file = translated_dir / translated_filename
+        jp_file = jp_dir / source_file
+
+        if translated_file.exists():
+            return translated_file
+        if jp_file.exists():
+            print(f"     [WARNING] Using JP source for: {source_file}")
+            return jp_file
+
+        # Fallback: try mapped chapter ID naming.
+        mapped_id = self._map_filename_to_chapter_id(source_file)
+        if mapped_id != source_file:
+            translated_file_mapped = translated_dir / f"{mapped_id}.md"
+            if translated_file_mapped.exists():
+                print(f"     [INFO] Mapped {source_file} -> {mapped_id}.md")
+                return translated_file_mapped
+
+        print(f"     [SKIP] File not found: {source_file}")
+        return None
+
+    def _group_chapters_by_raw_group_index(self, chapters: List[dict]) -> List[List[dict]]:
+        """
+        Group consecutive chapters that originated from the same raw spine group.
+
+        Chapters without raw_group_index remain standalone.
+        """
+        grouped: List[List[dict]] = []
+        current_group: List[dict] = []
+        current_raw_group: Optional[int] = None
+
+        for chapter in chapters:
+            raw_group = chapter.get('raw_group_index')
+            if raw_group is None:
+                if current_group:
+                    grouped.append(current_group)
+                    current_group = []
+                    current_raw_group = None
+                grouped.append([chapter])
+                continue
+
+            if not current_group:
+                current_group = [chapter]
+                current_raw_group = raw_group
+                continue
+
+            if raw_group == current_raw_group:
+                current_group.append(chapter)
+                continue
+
+            grouped.append(current_group)
+            current_group = [chapter]
+            current_raw_group = raw_group
+
+        if current_group:
+            grouped.append(current_group)
+
+        return grouped
+
+    def _should_merge_split_chapters_to_raw_structure(
+        self,
+        manifest: dict,
+        work_dir: Path,
+        chapters: List[dict]
+    ) -> tuple:
+        """
+        Decide whether Builder should re-merge split chapters back to raw structure.
+
+        BYPASS: The spine merge exists to re-assemble chapters that were split at
+        raw XHTML boundaries during Librarian extraction. When the translator has
+        already completed all chapters (translator.chapters_completed ==
+        translator.chapters_total), each EN file is already a canonical chapter —
+        there is nothing to merge. Context.xml chapter_titles_en and manifest.json
+        metadata_en are the authoritative chapter sources, not the raw EPUB XHTML.
+        The raw extraction and EPUB rebuild are separate concerns; the builder
+        constructs chapters from metadata, not raw structure.
+        """
+        translator_state = manifest.get('pipeline_state', {}).get('translator', {})
+        if translator_state.get('status') == 'completed' and translator_state.get('chapters_completed', 0) == translator_state.get('chapters_total', 0):
+            return False, {"reason": "translator_complete_all_chapters — bypassing spine merge; chapters built from metadata"}
+
+        split_chapters = [
+            ch for ch in chapters
+            if ch.get('split_strategy') == 'text_page_boundary'
+            and ch.get('raw_group_index') is not None
+        ]
+        if not split_chapters:
+            return False, {"reason": "no_text_page_boundary_split"}
+
+        raw_group_count = len({ch.get('raw_group_index') for ch in split_chapters})
+        if raw_group_count <= 0 or len(chapters) <= raw_group_count:
+            return False, {"reason": "nothing_to_merge"}
+
+        inspection = self._inspect_raw_single_content_structure(work_dir)
+        librarian_state = manifest.get('pipeline_state', {}).get('librarian', {})
+        toc_entries = librarian_state.get('toc_entries')
+        malformed_toc = inspection.get('malformed_toc', False)
+        if not malformed_toc and isinstance(toc_entries, int):
+            malformed_toc = toc_entries <= 3
+        one_content_structure = inspection.get('one_content_structure', False)
+
+        if malformed_toc and one_content_structure:
+            return True, {
+                "reason": "verified_malformed_toc_single_content",
+                "raw_group_count": raw_group_count,
+                "inspection": inspection,
+            }
+
+        return False, {
+            "reason": "raw_structure_verification_failed",
+            "inspection": inspection,
+        }
+
+    def _detect_title_in_body(self, body: Any, title_patterns: List[re.Pattern]) -> Optional[str]:
+        """Detect chapter title markers from a parsed XHTML body."""
+        for tag in ['h1', 'h2', 'h3']:
+            heading = body.find(tag)
+            if heading:
+                text = heading.get_text(strip=True)
+                if text and len(text) > 0 and len(text) < 100:
+                    for pattern in title_patterns:
+                        if pattern.search(text):
+                            return text
+                    if len(text) > 2:
+                        return text
+
+        paragraphs = body.find_all('p', limit=5)
+        for p in paragraphs:
+            text = p.get_text(strip=True)
+            if not text:
+                continue
+            for pattern in title_patterns:
+                match = pattern.search(text)
+                if match:
+                    matched_text = match.group(0)
+                    if text.startswith(matched_text):
+                        return text if len(text) < 50 else matched_text
+                    return matched_text
+
+        return None
+
+    def _inspect_raw_single_content_structure(self, work_dir: Path) -> Dict[str, Any]:
+        """
+        Inspect extracted raw EPUB TOC/spine to detect malformed TOC + single-content layout.
+        """
+        inspection = {
+            "toc_entries": 0,
+            "spine_items": 0,
+            "text_page_count": 0,
+            "detected_title_count": 0,
+            "malformed_toc": False,
+            "one_content_structure": False,
+        }
+
+        # TOC diagnostics
+        toc_path = work_dir / "toc.json"
+        if toc_path.exists():
+            try:
+                toc_data = json.loads(toc_path.read_text(encoding='utf-8'))
+                nav_points = toc_data.get("nav_points", [])
+                if isinstance(nav_points, list):
+                    inspection["toc_entries"] = len(nav_points)
+            except Exception:
+                pass
+        inspection["malformed_toc"] = inspection["toc_entries"] <= 3
+
+        # Locate OPF
+        opf_path = work_dir / "_epub_extracted" / "item" / "standard.opf"
+        if not opf_path.exists():
+            candidates = sorted(work_dir.glob("_epub_extracted/**/standard.opf"))
+            if candidates:
+                opf_path = candidates[0]
+        if not opf_path.exists():
+            return inspection
+
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:
+            return inspection
+
+        try:
+            ns = {'opf': 'http://www.idpf.org/2007/opf'}
+            root = ET.parse(opf_path).getroot()
+            manifest_items = {
+                item.attrib['id']: item.attrib.get('href', '')
+                for item in root.findall('.//opf:manifest/opf:item', ns)
+                if item.attrib.get('id')
+            }
+            spine_idrefs = [
+                item.attrib.get('idref', '')
+                for item in root.findall('.//opf:spine/opf:itemref', ns)
+            ]
+            inspection["spine_items"] = len(spine_idrefs)
+
+            title_patterns = [
+                re.compile(p, re.IGNORECASE)
+                for p in [
+                    r'^第[一二三四五六七八九十百千]+章',
+                    r'^第\d+章',
+                    r'^第[一二三四五六七八九十百千]+話',
+                    r'^第\d+話',
+                    r'^Chapter\s*\d+',
+                    r'^プロローグ',
+                    r'^エピローグ',
+                    r'^幕間',
+                    r'^あとがき',
+                    r'^Prologue',
+                    r'^Epilogue',
+                    r'^Interlude',
+                ]
+            ]
+            skip_patterns = ('cover', 'toc', 'nav', 'titlepage', 'caution', 'colophon', '998', '999')
+
+            for idref in spine_idrefs:
+                href = manifest_items.get(idref, '')
+                if not href:
+                    continue
+                filename = href.split('/')[-1]
+                if any(skip in filename.lower() for skip in skip_patterns):
+                    continue
+
+                xhtml_path = opf_path.parent / href
+                if not xhtml_path.exists():
+                    continue
+
+                content = xhtml_path.read_text(encoding='utf-8', errors='ignore')
+                soup = BeautifulSoup(content, 'xml')
+                body = soup.find('body')
+                if not body:
+                    continue
+
+                text = body.get_text(strip=True)
+                has_text = not (body.find('svg') and not text) and len(text) > 20
+                if not has_text:
+                    continue
+
+                inspection["text_page_count"] += 1
+                if self._detect_title_in_body(body, title_patterns):
+                    inspection["detected_title_count"] += 1
+
+            inspection["one_content_structure"] = (
+                inspection["text_page_count"] >= 4
+                and inspection["detected_title_count"] <= 1
+            )
+        except Exception:
+            return inspection
+
+        return inspection
+
+    # Compiled once at class level — matches every HTML comment that carries an
+    # MTLS editor annotation.  The pattern is intentionally broad so any future
+    # annotation keyword (ADVISOR_FORCE, ADVISOR_REQUIRED, MTLS_NOTE, etc.) is
+    # caught automatically.  Inline annotations trailing prose are removed along
+    # with any leading/trailing whitespace left on that line; whole-line
+    # annotations collapse to an empty string which the blank-line logic below
+    # then discards cleanly.
+    _EDITOR_ANNOTATION_RE: re.Pattern = re.compile(
+        r"""
+        <!--                    # HTML comment open
+        \s*                     # optional leading whitespace
+        (?:
+            ADVISOR[_\s]?(?:FORCE|REQUIRED)  # routing override annotations
+          | MTLS_[A-Z_]+        # any MTLS_ prefixed annotation
+          | PIPELINE_[A-Z_]+    # any PIPELINE_ prefixed annotation
+        )
+        [^-]*                   # any trailing text inside the comment
+        -->                     # HTML comment close
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    def _strip_editor_annotations(self, text: str) -> str:
+        """Remove all MTLS editor annotation HTML comments from *text*.
+
+        Called once on the full markdown string before line-splitting so that
+        annotations can appear anywhere — standalone lines, trailing a sentence,
+        or mid-paragraph — without leaving stray whitespace or empty paragraphs
+        in the EPUB output.
+
+        Whole-line annotations (line contains only the comment + whitespace) are
+        collapsed to an empty string; the paragraph loop in
+        ``_markdown_to_paragraphs`` then discards them as blank lines.
+        """
+        # First pass: remove annotations that occupy their own line entirely.
+        text = re.sub(
+            r"(?m)^[ \t]*" + self._EDITOR_ANNOTATION_RE.pattern + r"[ \t]*$",
+            "",
+            text,
+            flags=re.IGNORECASE | re.VERBOSE,
+        )
+        # Second pass: strip inline annotations that trail prose on the same line.
+        text = self._EDITOR_ANNOTATION_RE.sub("", text)
+        return text
+
+    def _markdown_to_paragraphs(
+        self,
+        md_content: str,
+        include_header_illustrations: bool = False,
+    ) -> List[str]:
+        """Convert markdown content to list of paragraphs."""
+        from src.Deepseek.common.config import ILLUSTRATION_PLACEHOLDER_PATTERN
+
+        # Strip MTLS editor annotations before any further processing so they
+        # never appear in EPUB output regardless of where they were placed.
+        md_content = self._strip_editor_annotations(md_content)
+
+        lines = md_content.split('\n')
+        paragraphs = []
+        content_started = False  # Track if we've seen actual content yet
+
+        for line in lines:
+            line = line.strip()
+
+            # A '# Title' line is the chapter's own H1 — already extracted
+            # separately by _extract_chapter_h1_title, and if several
+            # chapters were merged into one batch (see the '\n\n'.join
+            # above), a later chunk's own H1 would otherwise duplicate as
+            # body text. A '## TITLE CORRECTION: ...' line is prep/QC
+            # scratch, same rule as in _extract_chapter_h1_title. Neither
+            # should ever print. Any other '##'+ line is a real sub-heading
+            # (e.g. an embedded scene/episode title) and must reach the
+            # XHTML converter instead of silently vanishing here.
+            if _CHAPTER_H1_RE.match(line) or _TITLE_CORRECTION_ANNOTATION_RE.match(line):
+                continue
+
+            # Empty line = blank marker
+            if not line:
+                # Count consecutive blanks to avoid infinite/huge gaps, but allow up to 5
+                blank_count = 0
+                for p in reversed(paragraphs):
+                    if p == "<blank>":
+                        blank_count += 1
+                    else:
+                        break
+                
+                if blank_count < 5:
+                    paragraphs.append("<blank>")
+                continue
+
+            # Check if this is a chapter-opening illustration (before any content)
+            # These are decorative title cards with Japanese text that should be skipped
+            is_illustration = bool(re.search(ILLUSTRATION_PLACEHOLDER_PATTERN, line))
+            
+            if is_illustration and not content_started:
+                if include_header_illustrations:
+                    print(f"     [KEEP] Chapter-opening illustration: {line}")
+                else:
+                    # Skip chapter-opening illustrations (stylized titles with Japanese text)
+                    print(f"     [SKIP] Chapter-opening illustration: {line}")
+                    continue
+            
+            # Mark that we've seen actual content (not just blanks)
+            if not content_started and line != "<blank>":
+                content_started = True
+
+            paragraphs.append(line)
+
+        # Remove trailing blanks
+        while paragraphs and paragraphs[-1] == "<blank>":
+            paragraphs.pop()
+
+        return paragraphs
+
+    def _map_filename_to_chapter_id(self, filename: str) -> str:
+        """
+        Map human-readable filename to manifest chapter ID.
+        
+        Supports flexible file naming by extracting chapter numbers and
+        mapping special chapter types (prologue, epilogue, etc.).
+        
+        Args:
+            filename: Human-readable filename (e.g., "Chapter 1_ Title.md")
+            
+        Returns:
+            Manifest chapter ID (e.g., "CHAPTER_01")
+        """
+        # Extract chapter number from filename
+        match = re.match(r'Chapter (\d+)', filename, re.IGNORECASE)
+        if match:
+            num = int(match.group(1))
+            return f"CHAPTER_{num:02d}"
+        
+        # Handle special chapters
+        if filename.lower().startswith('interlude'):
+            match = re.match(r'Interlude (\d+)', filename, re.IGNORECASE)
+            if match:
+                return f"INTERLUDE_{int(match.group(1)):02d}"
+
+        if filename.lower().startswith('intermission'):
+            match = re.match(r'Intermission (\d+)', filename, re.IGNORECASE)
+            if match:
+                return f"INTERMISSION_{int(match.group(1)):02d}"
+        
+        if filename.lower().startswith('epilogue'):
+            return "EPILOGUE"
+        
+        if filename.lower().startswith('afterword'):
+            return "AFTERWORD"
+        
+        if filename.lower().startswith('prologue'):
+            return "PROLOGUE"
+        
+        return filename
+
+    def _detect_kuchie_images(self, assets: Dict, manifest: Dict = None, structure: Dict = None) -> List[str]:
+        """
+        Auto-detect kuchi-e images from manifest assets.
+
+        First checks for explicit kuchie list in assets, then falls back
+        to pattern matching on illustration filenames, and finally checks
+        the chapters array for kuchie entries (schema v3.6+).
+        
+        For v3.7 schema, reads from structure.illustrations array.
+
+        For RTL→LTR conversions, automatically reverses the kuchie order
+        to maintain correct visual reading flow based on the original EPUB's
+        page-progression-direction detected by the Librarian.
+
+        Args:
+            assets: Assets dictionary from manifest (v3.0-3.5)
+            manifest: Full manifest dictionary (optional, for RTL detection and chapter lookup)
+            structure: Structure dictionary from manifest (v3.7+)
+
+        Returns:
+            List of kuchi-e image filenames (reversed for RTL→LTR conversions)
+        """
+        def _as_file_list(values: Any) -> List[str]:
+            files: List[str] = []
+            if not isinstance(values, list):
+                return files
+            for item in values:
+                if isinstance(item, dict):
+                    candidate = item.get('file') or Path(item.get('image_path', '')).name
+                else:
+                    candidate = str(item) if item is not None else ''
+                candidate = self._coerce_text(candidate, '')
+                if candidate:
+                    files.append(candidate)
+            return files
+
+        kuchie_list = _as_file_list(assets.get('kuchie', []))
+        
+        # v3.7 schema: check structure.illustrations for frontmatter kuchie (exclude cover)
+        if not kuchie_list and structure:
+            kuchie_list = [
+                ill.get('file', '') 
+                for ill in structure.get('illustrations', [])
+                if ill.get('location') == 'frontmatter' 
+                and ill.get('file')
+                and ill.get('id', '').lower() != 'cover'  # Exclude cover image
+            ]
+
+        if not kuchie_list:
+            # Fallback: detect from illustrations with naming patterns
+            kuchie_patterns = [
+                r'^kuchie[-_].*\.jpe?g$',
+                r'^k\d{3}(?:[-_]\d{3})?\.jpe?g$',
+                r'^p00[1-9](?:[-_]p?00[1-9])?\.jpe?g$',
+                r'^frontis.*\.jpe?g$',
+                r'^color.*\.jpe?g$',
+            ]
+            kuchie_images = []
+            for illust in assets.get('illustrations', []):
+                filename = self._coerce_text(
+                    illust.get('file') if isinstance(illust, dict) else illust,
+                    '',
+                )
+                if not filename:
+                    continue
+                for pattern in kuchie_patterns:
+                    if re.match(pattern, filename, re.IGNORECASE):
+                        kuchie_images.append(filename)
+                        break
+            kuchie_list = kuchie_images
+
+        # Second fallback: Check chapters array for kuchie entry (schema v3.6+)
+        if not kuchie_list and manifest:
+            for chapter in manifest.get('chapters', []):
+                if chapter.get('id') == 'kuchie':
+                    kuchie_list = _as_file_list(chapter.get('illustrations', []))
+                    break
+
+        # Filter allcover/cover noise and dedupe while preserving order.
+        filtered: List[str] = []
+        seen = set()
+        for name in kuchie_list:
+            lower = str(name).lower()
+            if not lower:
+                continue
+            if 'allcover' in lower:
+                continue
+            if lower == 'cover.jpg':
+                continue
+            if lower in seen:
+                continue
+            filtered.append(name)
+            seen.add(lower)
+        
+        # DON'T auto-reverse kuchie order - the librarian extraction already
+        # provides them in correct visual/narrative order via sequential numbering.
+        # Kuchi-e (color plates) don't follow text reading direction; they're
+        # presented in a visual sequence independent of RTL/LTR.
+        #
+        # Historical note: Previous auto-reversal logic caused incorrect order
+        # because it double-reversed already-sorted kuchie-001.jpg through kuchie-NNN.jpg
+        # filenames from the extraction phase.
+        
+        return filtered
+
+    def _detect_illustration_images(
+        self,
+        manifest: Dict[str, Any],
+        work_dir: Path,
+        kuchie_list: Optional[List[str]] = None,
+    ) -> List[str]:
+        """
+        Resolve illustration filenames for both legacy and spine-based manifests.
+
+        Sources (in order):
+        1) assets.illustrations (strings or metadata dicts)
+        2) structure.illustrations (v3.7+) excluding frontmatter/cover
+        3) chapter illustration references
+        4) filesystem fallback (assets/illustrations and assets root)
+        """
+        assets = manifest.get('assets', {}) if isinstance(manifest, dict) else {}
+        structure = manifest.get('structure', {}) if isinstance(manifest, dict) else {}
+        chapters = manifest.get('chapters', []) if isinstance(manifest, dict) else []
+
+        allowed_ext = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'}
+        kuchie_set = {str(k).lower() for k in (kuchie_list or [])}
+
+        def _extract_name(item: Any) -> str:
+            if isinstance(item, dict):
+                candidate = item.get('file') or Path(item.get('image_path', '')).name
+            else:
+                candidate = item
+            return self._coerce_text(candidate, '')
+
+        ordered: List[str] = []
+        seen = set()
+
+        def _add(name: str):
+            lower = str(name).lower()
+            if not lower:
+                return
+            if Path(name).suffix.lower() not in allowed_ext:
+                return
+            if lower in seen:
+                return
+            if 'allcover' in lower:
+                return
+            if lower == 'cover.jpg':
+                return
+            if lower in kuchie_set:
+                return
+            seen.add(lower)
+            ordered.append(name)
+
+        # 1) assets.illustrations
+        for item in assets.get('illustrations', []) if isinstance(assets.get('illustrations', []), list) else []:
+            _add(_extract_name(item))
+
+        # 2) structure.illustrations (skip frontmatter/cover id)
+        if isinstance(structure.get('illustrations'), list):
+            for item in structure.get('illustrations', []):
+                if not isinstance(item, dict):
+                    _add(_extract_name(item))
+                    continue
+                if str(item.get('id', '')).lower() == 'cover':
+                    continue
+                if str(item.get('location', '')).lower() == 'frontmatter':
+                    continue
+                _add(_extract_name(item))
+
+        # 3) chapters[].illustrations
+        for chapter in chapters:
+            chapter_ills = chapter.get('illustrations', []) if isinstance(chapter, dict) else []
+            if not isinstance(chapter_ills, list):
+                continue
+            for item in chapter_ills:
+                _add(_extract_name(item))
+
+        # 4) filesystem fallback
+        assets_dir = work_dir / 'assets'
+        fallback_dirs = [assets_dir / 'illustrations', assets_dir]
+        for folder in fallback_dirs:
+            if not folder.exists() or not folder.is_dir():
+                continue
+            for path in sorted(folder.iterdir()):
+                if not path.is_file():
+                    continue
+                _add(path.name)
+
+        return ordered
+
+    def _process_images(
+        self,
+        manifest: dict,
+        work_dir: Path,
+        paths: EPUBPaths
+    ) -> tuple:
+        """
+        Emit all images into Images/ under the active device profile and
+        analyze kuchi-e dimensions.
+
+        Images are no longer copied unconditionally. The profile decides
+        whether each one is fitted to a box, converted to grayscale,
+        re-encoded as baseline JPEG, or transcoded outright. A transcode
+        changes the filename, so the rename map has to reach both the OPF
+        manifest (done here) and every <img src> in the generated XHTML
+        (done by _apply_image_renames).
+
+        Returns:
+            Tuple of (manifest_items, kuchie_metadata, renamed, emit_results)
+        """
+        # Support both v3.0-3.5 (assets key) and v3.7 (structure.illustrations) schemas
+        assets = manifest.get('assets', {})
+        structure = manifest.get('structure', {})
+
+        manifest_items = []
+        emit_results: List[EmitResult] = []
+        renamed: Dict[str, str] = {}
+
+        assets_dir = work_dir / "assets"
+
+        def _emit(source_path: Path, is_cover: bool = False) -> str:
+            """Emit one image under the profile; returns the emitted filename."""
+            result = optimize_image_to(
+                source_path, paths.images_dir, self.profile, is_cover=is_cover
+            )
+            emit_results.append(result)
+            if result.renamed:
+                renamed[result.source_name] = result.emitted_name
+            return result.emitted_name
+
+        # Cover - Skip allcover images entirely
+        # Guardrail: normalize cover to a plain string filename.
+        # A dict (spine metadata or manual manifest corruption) must not reach
+        # assets_dir / cover or the f-string src= in create_cover_xhtml.
+        raw_cover = assets.get('cover')
+        if raw_cover is not None:
+            cover = self._coerce_text(raw_cover, '')
+            if not isinstance(raw_cover, str):
+                print(f"     [WARNING] assets.cover is {type(raw_cover).__name__} (expected str); coerced to '{cover}'")
+            if not cover:
+                cover = None
+        else:
+            cover = None
+        if cover and 'allcover' in cover.lower():
+            print(f"     [SKIP] Filtering out allcover image: {cover}")
+            # Try to find actual cover.jpg in assets directory
+            actual_cover = assets_dir / "cover.jpg"
+            if actual_cover.exists():
+                cover = "cover.jpg"
+                print(f"     [FOUND] Using actual cover.jpg instead")
+            else:
+                cover = None
+                print(f"     [WARNING] No cover.jpg found, skipping cover")
+        
+        if cover:
+            cover_path = assets_dir / cover
+            print(f"     [COVER] Filename: {cover}")
+            print(f"     [COVER] Source path: {cover_path}")
+            print(f"     [COVER] Exists: {cover_path.exists()}")
+            if cover_path.exists():
+                emitted_cover = _emit(cover_path, is_cover=True)
+                print(f"     [COVER] Destination: {paths.images_dir / emitted_cover}")
+                manifest_items.append(ManifestItem(
+                    id="cover-image",
+                    href=f"Images/{emitted_cover}",
+                    media_type=self._get_image_media_type(emitted_cover),
+                    properties="cover-image"
+                ))
+                print(f"     [OK] Emitted cover: {emitted_cover}")
+            else:
+                print(f"     [WARNING] Cover file not found: {cover_path}")
+        else:
+            print(f"     [WARNING] No cover specified in manifest")
+
+        # Kuchie - copy and analyze dimensions
+        # Use helper to handle both list and dict formats, passing structure for v3.7
+        kuchie_list = self._detect_kuchie_images(assets, manifest, structure)
+        for i, kuchie in enumerate(kuchie_list):
+            # Try subdirectory first (old format), then root assets directory (new format)
+            kuchie_path = assets_dir / "kuchie" / kuchie
+            if not kuchie_path.exists():
+                kuchie_path = assets_dir / kuchie
+            
+            if kuchie_path.exists():
+                emitted_kuchie = _emit(kuchie_path)
+                manifest_items.append(ManifestItem(
+                    id=f"kuchie-img-{i+1:03d}",  # Use 'kuchie-img' to avoid conflict with XHTML page IDs
+                    href=f"Images/{emitted_kuchie}",
+                    media_type=self._get_image_media_type(emitted_kuchie)
+                ))
+
+        # Analyze kuchi-e dimensions for orientation detection
+        kuchie_metadata = analyze_kuchie_images(assets_dir, kuchie_list)
+
+        # Illustrations - unified resolver supports:
+        # - legacy normalized names (illust-###)
+        # - spine-based originals (e.g., p015.jpg, P013.jpg, image_rsrc###, etc.)
+        # - metadata dict forms with file/image_path
+        illust_list = self._detect_illustration_images(
+            manifest=manifest,
+            work_dir=work_dir,
+            kuchie_list=kuchie_list,
+        )
+
+        # Track copied illustrations to avoid duplicates
+        copied_illustrations = set()
+        illust_counter = 0
+        
+        for illust in illust_list:
+            # v3.7: images are in root assets directory
+            # v3.0-3.5: images are in assets/illustrations subdirectory
+            illust_path = assets_dir / illust
+            if not illust_path.exists():
+                illust_path = assets_dir / "illustrations" / illust
+            
+            if illust_path.exists():
+                emitted_illust = _emit(illust_path)
+                illust_counter += 1
+                manifest_items.append(ManifestItem(
+                    id=f"illust-{illust_counter:03d}",
+                    href=f"Images/{emitted_illust}",
+                    media_type=self._get_image_media_type(emitted_illust)
+                ))
+                # Tracked by SOURCE name: this set dedupes the input list.
+                copied_illustrations.add(illust)
+
+        # Additional images (titlepage, manga headers, etc.)
+        additional_list = assets.get('additional', [])
+        for i, additional in enumerate(additional_list):
+            additional_path = assets_dir / "additional" / additional
+            if additional_path.exists():
+                emitted_additional = _emit(additional_path)
+                manifest_items.append(ManifestItem(
+                    id=f"additional-{i+1:03d}",
+                    href=f"Images/{emitted_additional}",
+                    media_type=self._get_image_media_type(emitted_additional)
+                ))
+
+        if emit_results:
+            print(f"     {summarize_images(emit_results)}")
+
+        return manifest_items, kuchie_metadata, renamed, emit_results
+
+    def _apply_image_renames(
+        self,
+        paths: EPUBPaths,
+        renamed: Dict[str, str],
+    ) -> int:
+        """
+        Rewrite image references in generated XHTML after a transcode.
+
+        When a profile converts art.gif to art.jpg, the OPF manifest is fixed
+        up at emission time but every <img src="../Images/art.gif"> in the
+        chapter and frontmatter XHTML still points at a file that no longer
+        exists. This is a post-pass rather than inline rewriting so it does not
+        depend on whether chapters or images were generated first.
+
+        Returns:
+            Number of XHTML files modified.
+        """
+        if not renamed:
+            return 0
+
+        touched = 0
+        for xhtml in sorted(paths.text_dir.glob("*.xhtml")):
+            try:
+                content = xhtml.read_text(encoding="utf-8")
+            except OSError as exc:
+                print(f"     [WARN] Could not read {xhtml.name} for rename pass: {exc}")
+                continue
+
+            original = content
+            for old_name, new_name in renamed.items():
+                # Anchored on the Images/ segment so a chapter that merely
+                # mentions the filename in prose is left alone.
+                content = content.replace(f"Images/{old_name}", f"Images/{new_name}")
+
+            if content != original:
+                xhtml.write_text(content, encoding="utf-8")
+                touched += 1
+
+        if touched:
+            print(f"     [OK] Rewrote {len(renamed)} image reference(s) across {touched} file(s)")
+        return touched
+
+    def _get_image_media_type(self, filename: str) -> str:
+        """Get MIME type for image file."""
+        ext = Path(filename).suffix.lower()
+        types = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+            '.svg': 'image/svg+xml'
+        }
+        return types.get(ext, 'image/jpeg')
+
+    def _generate_frontmatter(
+        self,
+        manifest: dict,
+        paths: EPUBPaths,
+        chapter_info: List[dict],
+        kuchie_metadata: Dict[str, dict],
+        language_code: str,
+        lang_config: dict,
+        target_language: str
+    ) -> List[ManifestItem]:
+        """
+        Generate cover, kuchi-e, and TOC pages.
+        
+        Args:
+            manifest: Manifest dictionary
+            paths: EPUB paths structure
+            chapter_info: List of chapter information
+            kuchie_metadata: Kuchi-e dimension metadata from _process_images
+            language_code: Language code for XHTML (e.g., 'en', 'vi')
+            
+        Returns:
+            List of manifest items for frontmatter
+        """
+        metadata_jp = manifest.get('metadata', {})
+        # Get language-specific metadata
+        metadata_key = f'metadata_{target_language}'
+        metadata_translated = manifest.get(metadata_key) or manifest.get('metadata_en', {})
+        assets = manifest.get('assets', {})
+        
+        # Get title in target language
+        title = self._resolve_book_title(
+            manifest=manifest,
+            metadata_jp=metadata_jp,
+            metadata_translated=metadata_translated,
+            target_language=target_language,
+            fallback="Unknown",
+        )
+        
+        # Get UI strings from language config
+        ui_strings = lang_config.get('ui_strings', {})
+        toc_title = self._coerce_text(ui_strings.get('toc_title', 'Table of Contents'), 'Table of Contents')
+
+        manifest_items = []
+
+        # 1. Cover page
+        # Check if first kuchie is actually the cover (spine-based extraction creates kuchie-001 from cover.jpg)
+        # Guardrail: coerce assets.cover to string — a dict (e.g. spine metadata) must not
+        # leak into the f-string in create_cover_xhtml, which would produce
+        # src="../Images/{'file': ...}"  (broken, unreadable EPUB).
+        raw_cover = assets.get('cover')
+        cover_image = self._coerce_text(raw_cover, 'cover.jpg') if raw_cover is not None else 'cover.jpg'
+        kuchie_assets = assets.get('kuchie', [])
+        if kuchie_assets:
+            # Handle both list and dict formats
+            first_kuchie = kuchie_assets[0] if isinstance(kuchie_assets, list) else kuchie_assets[0] if isinstance(kuchie_assets[0], str) else kuchie_assets[0].get('file', '')
+            first_kuchie_original = None
+            if isinstance(kuchie_assets[0], dict):
+                first_kuchie_original = kuchie_assets[0].get('original', '')
+            
+            # If first kuchie's original is cover.jpg, use first kuchie file as the actual cover
+            if first_kuchie_original and 'cover' in first_kuchie_original.lower():
+                cover_image = first_kuchie
+                print(f"     [INFO] Using {first_kuchie} as cover (spine-extracted from {first_kuchie_original})")
+        
+        cover_path = paths.text_dir / "cover.xhtml"
+        StructureBuilder.create_cover_xhtml(cover_path, title, language_code, cover_image)
+        manifest_items.append(ManifestItem(
+            id="cover",
+            href="Text/cover.xhtml",
+            media_type="application/xhtml+xml"
+        ))
+
+        # 2. Kuchi-e pages (NEW!)
+        kuchie_list = self._detect_kuchie_images(
+            assets,
+            manifest,
+            manifest.get('structure', {}),
+        )
+        
+        # Multi-act: only place Act 1 kuchie in front matter
+        volume_structure = manifest.get('volume_structure', {})
+        is_multi_act = volume_structure.get('is_multi_act', False) and len(volume_structure.get('acts', [])) >= 2
+        
+        if is_multi_act:
+            # Filter to Act 1 kuchie only (by checking assets.kuchie metadata)
+            kuchie_assets = assets.get('kuchie', [])
+            act1_kuchie_files = set()
+            for k in kuchie_assets:
+                if isinstance(k, dict) and k.get('act', 1) == 1:
+                    act1_kuchie_files.add(k.get('file', ''))
+                elif isinstance(k, str):
+                    act1_kuchie_files.add(k)  # Legacy format: assume Act 1
+            
+            # If no act tags found, use kuchie from volume_structure.acts[0]
+            if not act1_kuchie_files and volume_structure.get('acts'):
+                act1_kuchie_files = set(volume_structure['acts'][0].get('kuchie_files', []))
+            
+            frontmatter_kuchie = [k for k in kuchie_list if k in act1_kuchie_files]
+            print(f"     [MULTI-ACT] Placing {len(frontmatter_kuchie)} Act 1 kuchie in front matter")
+        else:
+            frontmatter_kuchie = kuchie_list
+        
+        for i, kuchie in enumerate(frontmatter_kuchie):
+            # Use global kuchie_list index for consistent IDs across acts
+            global_idx = kuchie_list.index(kuchie) if kuchie in kuchie_list else i
+            kuchie_id = f"kuchie-{global_idx+1:03d}"
+            kuchie_xhtml = f"kuchie{global_idx+1:03d}.xhtml"
+            kuchie_path = paths.text_dir / kuchie_xhtml
+
+            # Check if horizontal
+            meta = kuchie_metadata.get(kuchie, {})
+            if meta.get('is_horizontal', False):
+                # Use SVG wrapper for horizontal
+                StructureBuilder.create_horizontal_kuchie_xhtml(
+                    kuchie_path,
+                    kuchie,
+                    meta['width'],
+                    meta['height'],
+                    kuchie_id,
+                    title,
+                    language_code
+                )
+            else:
+                # Standard image page for vertical
+                StructureBuilder.create_image_page_xhtml(
+                    kuchie_path,
+                    kuchie,
+                    kuchie_id,
+                    title,
+                    language_code,
+                    "kuchie-image"
+                )
+
+            manifest_items.append(ManifestItem(
+                id=kuchie_id,
+                href=f"Text/{kuchie_xhtml}",
+                media_type="application/xhtml+xml"
+            ))
+            orientation = 'horizontal' if meta.get('is_horizontal') else 'vertical'
+            print(f"     [OK] Generated {kuchie_xhtml} ({orientation})")
+
+        # 3. Visual TOC page
+        toc_entries = []
+        
+        # Multi-act: group chapters under act headings
+        volume_structure = manifest.get('volume_structure', {})
+        vis_acts = volume_structure.get('acts', [])
+        is_vis_multi_act = volume_structure.get('is_multi_act', False) and len(vis_acts) >= 2
+        
+        if is_vis_multi_act:
+            # Build chapter-to-act mapping
+            chapters_manifest = manifest.get('chapters', [])
+            chapters_sorted = sorted(chapters_manifest, key=lambda c: c.get('toc_order', 999))
+            ch_id_to_act = {}
+            for act in vis_acts:
+                first_idx = act.get('first_chapter_index', 0)
+                last_idx = act.get('last_chapter_index', len(chapters_sorted) - 1)
+                for j in range(first_idx, min(last_idx + 1, len(chapters_sorted))):
+                    ch_id_to_act[chapters_sorted[j].get('id', '')] = act
+            
+            current_act_num = 0
+            for ch in chapter_info:
+                if ch.get('pre_toc'):
+                    continue
+                act = ch_id_to_act.get(ch['id'])
+                if act and act['act_number'] != current_act_num:
+                    current_act_num = act['act_number']
+                    act_label = self._coerce_text(
+                        act.get('title_en') or act.get('title', f"Act {current_act_num}"),
+                        f"Act {current_act_num}"
+                    )
+                    separator_href = f"act{current_act_num:03d}_separator.xhtml" if current_act_num >= 2 else ch['xhtml_filename']
+                    toc_entries.append({
+                        'href': separator_href,
+                        'label': f"— {act_label} —"
+                    })
+                toc_entries.append({
+                    'href': ch['xhtml_filename'],
+                    'label': self._coerce_text(ch.get('title'), 'Chapter')
+                })
+        else:
+            for ch in chapter_info:
+                if ch.get('pre_toc'):
+                    continue
+                toc_entries.append({
+                    'href': ch['xhtml_filename'],
+                    'label': self._coerce_text(ch.get('title'), 'Chapter')
+                })
+
+        toc_path = paths.text_dir / "toc.xhtml"
+        StructureBuilder.create_toc_xhtml(
+            toc_path, toc_entries, toc_title, title, language_code
+        )
+        manifest_items.append(ManifestItem(
+            id="toc-page",
+            href="Text/toc.xhtml",
+            media_type="application/xhtml+xml"
+        ))
+
+        return manifest_items
+
+    def _generate_act_interstitials(
+        self,
+        manifest: dict,
+        paths: EPUBPaths,
+        chapter_info: List[dict],
+        kuchie_metadata: Dict[str, dict],
+        language_code: str,
+        lang_config: dict,
+        target_language: str
+    ) -> List[ManifestItem]:
+        """
+        Generate act separator pages and per-act kuchie for multi-act EPUBs.
+        
+        For each act >= 2, generates:
+        1. An act separator page (tobira equivalent) with act title
+        2. Kuchie pages for that act's color plates
+        
+        Args:
+            manifest: Manifest dictionary
+            paths: EPUB paths structure
+            chapter_info: List of chapter information
+            kuchie_metadata: Kuchi-e dimension metadata
+            language_code: Language code for XHTML
+            lang_config: Language configuration dict
+            target_language: Target language code
+            
+        Returns:
+            List of manifest items for act interstitials
+        """
+        volume_structure = manifest.get('volume_structure', {})
+        volume_acts = volume_structure.get('acts', [])
+        assets = manifest.get('assets', {})
+        metadata_jp = manifest.get('metadata', {})
+        metadata_key = f'metadata_{target_language}'
+        metadata_translated = manifest.get(metadata_key) or manifest.get('metadata_en', {})
+        book_title = self._resolve_book_title(
+            manifest=manifest,
+            metadata_jp=metadata_jp,
+            metadata_translated=metadata_translated,
+            target_language=target_language,
+            fallback="Unknown",
+        )
+        
+        # Get full kuchie list for global indexing
+        kuchie_list = self._detect_kuchie_images(
+            assets,
+            manifest,
+            manifest.get('structure', {}),
+        )
+        
+        manifest_items = []
+        
+        for act in volume_acts:
+            if act['act_number'] < 2:
+                continue  # Act 1 handled in frontmatter
+            
+            act_num = act['act_number']
+            act_title = self._coerce_text(
+                act.get('title_en') or act.get('title', f'Act {act_num}'),
+                f'Act {act_num}'
+            )
+            
+            # 1. Generate act separator page
+            separator_id = f"act-{act_num:03d}-separator"
+            separator_xhtml = f"act{act_num:03d}_separator.xhtml"
+            separator_path = paths.text_dir / separator_xhtml
+            
+            StructureBuilder.create_act_separator_xhtml(
+                separator_path,
+                act_title,
+                act_num,
+                book_title,
+                language_code
+            )
+            
+            manifest_items.append(ManifestItem(
+                id=separator_id,
+                href=f"Text/{separator_xhtml}",
+                media_type="application/xhtml+xml"
+            ))
+            print(f"     [OK] Generated act separator: {separator_xhtml}")
+            
+            # 2. Generate kuchie pages for this act
+            act_kuchie_files = set(act.get('kuchie_files', []))
+            
+            # Also check assets.kuchie for act-tagged entries
+            kuchie_assets = assets.get('kuchie', [])
+            for k in kuchie_assets:
+                if isinstance(k, dict) and k.get('act') == act_num:
+                    act_kuchie_files.add(k.get('file', ''))
+            
+            act_kuchie = [k for k in kuchie_list if k in act_kuchie_files]
+            
+            for kuchie in act_kuchie:
+                # Use global kuchie_list index for consistent IDs
+                global_idx = kuchie_list.index(kuchie) if kuchie in kuchie_list else 0
+                kuchie_id = f"kuchie-{global_idx+1:03d}"
+                kuchie_xhtml = f"kuchie{global_idx+1:03d}.xhtml"
+                kuchie_path = paths.text_dir / kuchie_xhtml
+                
+                meta = kuchie_metadata.get(kuchie, {})
+                if meta.get('is_horizontal', False):
+                    StructureBuilder.create_horizontal_kuchie_xhtml(
+                        kuchie_path, kuchie,
+                        meta['width'], meta['height'],
+                        kuchie_id, book_title, language_code
+                    )
+                else:
+                    StructureBuilder.create_image_page_xhtml(
+                        kuchie_path, kuchie, kuchie_id,
+                        book_title, language_code, "kuchie-image"
+                    )
+                
+                manifest_items.append(ManifestItem(
+                    id=kuchie_id,
+                    href=f"Text/{kuchie_xhtml}",
+                    media_type="application/xhtml+xml"
+                ))
+                orientation = 'horizontal' if meta.get('is_horizontal') else 'vertical'
+                print(f"     [OK] Generated Act {act_num} kuchie: {kuchie_xhtml} ({orientation})")
+        
+        return manifest_items
+
+    def _generate_navigation(
+        self,
+        manifest: dict,
+        paths: EPUBPaths,
+        chapter_info: List[dict],
+        language_code: str,
+        lang_config: dict,
+        target_language: str
+    ) -> List[ManifestItem]:
+        """Generate nav.xhtml and toc.ncx."""
+        metadata_jp = manifest.get('metadata', {})
+        # Get language-specific metadata
+        metadata_key = f'metadata_{target_language}'
+        metadata_translated = manifest.get(metadata_key) or manifest.get('metadata_en', {})
+        
+        # Get title in target language
+        title = self._resolve_book_title(
+            manifest=manifest,
+            metadata_jp=metadata_jp,
+            metadata_translated=metadata_translated,
+            target_language=target_language,
+            fallback="Unknown",
+        )
+        identifier = manifest.get('volume_id', '')
+        
+        # Get UI strings from language config
+        ui_strings = lang_config.get('ui_strings', {})
+        toc_title = self._coerce_text(ui_strings.get('toc_title', 'Table of Contents'), 'Table of Contents')
+        cover_title = self._coerce_text(ui_strings.get('cover_title', 'Cover'), 'Cover')
+        start_content = self._coerce_text(ui_strings.get('start_content', 'Start of Content'), 'Start of Content')
+
+        manifest_items = []
+
+        # Build TOC entries for nav.xhtml
+        toc_entries = [TOCEntry(label=cover_title, href="cover.xhtml")]
+        toc_entries.append(TOCEntry(label=toc_title, href="toc.xhtml"))
+
+        # Check for multi-act structure → nested TOC
+        volume_structure = manifest.get('volume_structure', {})
+        volume_acts = volume_structure.get('acts', [])
+        is_multi_act = volume_structure.get('is_multi_act', False) and len(volume_acts) >= 2
+
+        if is_multi_act:
+            # Build nested TOC: act headings with child chapter entries
+            # Create a set of chapter IDs per act for lookup
+            chapters_manifest = manifest.get('chapters', [])
+            chapters_sorted = sorted(chapters_manifest, key=lambda c: c.get('toc_order', 999))
+            
+            for act in volume_acts:
+                act_title = self._coerce_text(
+                    act.get('title_en') or act.get('title', f"Act {act['act_number']}"),
+                    f"Act {act['act_number']}"
+                )
+                first_idx = act.get('first_chapter_index', 0)
+                last_idx = act.get('last_chapter_index', len(chapters_sorted) - 1)
+                
+                # Get chapter IDs for this act
+                act_chapter_ids = set()
+                for j in range(first_idx, min(last_idx + 1, len(chapters_sorted))):
+                    act_chapter_ids.add(chapters_sorted[j].get('id', ''))
+                
+                # Build child entries from chapter_info that match this act
+                child_entries = []
+                for ch in chapter_info:
+                    if ch.get('pre_toc'):
+                        continue
+                    if ch['id'] in act_chapter_ids:
+                        child_entries.append(TOCEntry(
+                            label=self._coerce_text(ch.get('title'), 'Chapter'),
+                            href=ch['xhtml_filename']
+                        ))
+                
+                # First child's href is the act entry's href (or separator)
+                if child_entries:
+                    act_href = child_entries[0].href
+                else:
+                    act_href = f"act{act['act_number']:03d}_separator.xhtml"
+                
+                act_entry = TOCEntry(
+                    label=act_title,
+                    href=act_href,
+                    children=child_entries
+                )
+                toc_entries.append(act_entry)
+        else:
+            # Flat TOC (original behavior); pre-TOC content is not listed
+            for ch in chapter_info:
+                if ch.get('pre_toc'):
+                    continue
+                toc_entries.append(TOCEntry(
+                    label=self._coerce_text(ch.get('title'), 'Chapter'),
+                    href=ch['xhtml_filename']
+                ))
+
+        # Landmarks
+        first_bodymatter = next((ch for ch in chapter_info if not ch.get('pre_toc')), None)
+        first_chapter = (first_bodymatter or (chapter_info[0] if chapter_info else None))
+        first_chapter = first_chapter['xhtml_filename'] if first_chapter else "chapter001.xhtml"
+        landmarks = [
+            Landmark(epub_type="cover", href="cover.xhtml", title=cover_title),
+            Landmark(epub_type="toc", href="nav.xhtml", title=toc_title),
+            Landmark(epub_type="bodymatter", href=first_chapter, title=start_content),
+        ]
+
+        # Generate nav.xhtml
+        nav_path = paths.text_dir / "nav.xhtml"
+        nav_gen = NavGenerator(language_code)
+        nav_gen.generate(nav_path, title, toc_entries, landmarks)
+        manifest_items.append(ManifestItem(
+            id="nav",
+            href="Text/nav.xhtml",
+            media_type="application/xhtml+xml",
+            properties="nav"
+        ))
+
+        # Build NCX nav points
+        nav_points = []
+        play_order = 1
+
+        nav_points.append(NavPoint(
+            id="nav_cover",
+            label=cover_title,
+            src="Text/cover.xhtml",
+            play_order=play_order
+        ))
+        play_order += 1
+
+        nav_points.append(NavPoint(
+            id="nav_toc",
+            label=toc_title,
+            src="Text/toc.xhtml",
+            play_order=play_order
+        ))
+        play_order += 1
+
+        for ch in chapter_info:
+            if ch.get('pre_toc'):
+                continue
+            nav_points.append(NavPoint(
+                id=f"nav_{ch['id']}",
+                label=self._coerce_text(ch.get('title'), 'Chapter'),
+                src=f"Text/{ch['xhtml_filename']}",
+                play_order=play_order
+            ))
+            play_order += 1
+
+        # For multi-act, NCX also uses flat structure (NCX doesn't support nesting well
+        # in most readers). The nav.xhtml handles the nested display.
+
+        # Generate toc.ncx
+        ncx_gen = NCXGenerator()
+        ncx_gen.generate(paths.toc_ncx, title, identifier, nav_points)
+        manifest_items.append(ManifestItem(
+            id="ncx",
+            href="toc.ncx",
+            media_type="application/x-dtbncx+xml"
+        ))
+
+        return manifest_items
+
+    def _create_stylesheet(self, paths: EPUBPaths, target_language: str = "en") -> List[ManifestItem]:
+        """Create CSS stylesheet for the active device profile."""
+        css_path = paths.styles_dir / "stylesheet.css"
+        css = STYLESHEETS.get(self.profile.stylesheet, DEFAULT_CSS)
+        if self.profile.stylesheet == "default":
+            # Language additions only on the full-CSS profile; the e-ink
+            # stylesheet is limited to the nine properties its firmware has.
+            css = css + LANGUAGE_CSS.get(str(target_language or "en").lower(), "")
+        css_path.write_text(css, encoding='utf-8')
+
+        return [ManifestItem(
+            id="css",
+            href="Styles/stylesheet.css",
+            media_type="text/css"
+        )]
+
+    def _generate_opf(
+        self,
+        manifest: dict,
+        work_dir: Path,
+        paths: EPUBPaths,
+        all_items: List[ManifestItem],
+        chapter_info: List[dict],
+        cover_image_id: Optional[str],
+        language_code: str,
+    ) -> None:
+        """Generate package.opf file."""
+        volume_identity = self._load_volume_identity(work_dir)
+
+        book_metadata = BookMetadata(
+            title=volume_identity['title_en'],
+            author=volume_identity['author_en'],
+            language=language_code,
+            publisher=volume_identity['publisher'],
+            series=volume_identity['series_en'],
+            series_index=volume_identity['volume_number'],
+            identifier=self._coerce_text(manifest.get('volume_id', ''), '')
+        )
+
+        # Build spine - order matters!
+        spine_items = []
+
+        # Cover first
+        spine_items.append(SpineItem(idref="cover", linear="no"))
+
+        # Detect multi-act structure for spine ordering
+        volume_structure = manifest.get('volume_structure', {})
+        volume_acts = volume_structure.get('acts', [])
+        is_multi_act = volume_structure.get('is_multi_act', False) and len(volume_acts) >= 2
+
+        # Kuchi-e pages (frontmatter position)
+        kuchie_list = self._detect_kuchie_images(
+            manifest.get('assets', {}), 
+            manifest, 
+            manifest.get('structure', {})
+        )
+
+        if is_multi_act:
+            # === ACT-AWARE SPINE ===
+            # Cover → Act 1 kuchie → TOC → Act 1 chapters →
+            # Act 2 separator → Act 2 kuchie → Act 2 chapters → ...
+            
+            # Build chapter-to-act mapping
+            chapters_manifest = manifest.get('chapters', [])
+            chapters_sorted = sorted(chapters_manifest, key=lambda c: c.get('toc_order', 999))
+            
+            # Map chapter IDs to their act number
+            chapter_act_map = {}  # chapter_id -> act_number
+            for act in volume_acts:
+                first_idx = act.get('first_chapter_index', 0)
+                last_idx = act.get('last_chapter_index', len(chapters_sorted) - 1)
+                for j in range(first_idx, min(last_idx + 1, len(chapters_sorted))):
+                    ch_id = chapters_sorted[j].get('id', '')
+                    chapter_act_map[ch_id] = act['act_number']
+            
+            # Build per-act kuchie sets
+            act_kuchie_map = {}  # act_number -> [kuchie_global_indices]
+            kuchie_assets = manifest.get('assets', {}).get('kuchie', [])
+            for global_idx, kuchie in enumerate(kuchie_list):
+                # Determine act from kuchie metadata
+                kuchie_act = 1  # default
+                for k in kuchie_assets:
+                    if isinstance(k, dict) and k.get('file') == kuchie:
+                        kuchie_act = k.get('act', 1)
+                        break
+                # Also check volume_structure.acts[].kuchie_files
+                for act in volume_acts:
+                    if kuchie in act.get('kuchie_files', []):
+                        kuchie_act = act['act_number']
+                        break
+                act_kuchie_map.setdefault(kuchie_act, []).append(global_idx)
+            
+            # Act 1 kuchie
+            for idx in act_kuchie_map.get(1, []):
+                spine_items.append(SpineItem(idref=f"kuchie-{idx+1:03d}"))
+            
+            # Pre-TOC content (front plates, premise pages) ahead of the TOC
+            for ch in chapter_info:
+                if not ch.get('pre_toc'):
+                    continue
+                if ch.get('header_id'):
+                    spine_items.append(SpineItem(idref=ch['header_id']))
+                spine_items.append(SpineItem(idref=ch['id']))
+
+            # TOC page
+            spine_items.append(SpineItem(idref="toc-page"))
+            
+            # Interleave chapters with act boundaries
+            current_act = 1
+            for ch in chapter_info:
+                if ch.get('pre_toc'):
+                    continue
+                ch_act = chapter_act_map.get(ch['id'], current_act)
+
+                # If we've crossed into a new act, insert separator + kuchie
+                if ch_act > current_act:
+                    for new_act_num in range(current_act + 1, ch_act + 1):
+                        # Act separator
+                        spine_items.append(SpineItem(idref=f"act-{new_act_num:03d}-separator"))
+                        # Act kuchie
+                        for idx in act_kuchie_map.get(new_act_num, []):
+                            spine_items.append(SpineItem(idref=f"kuchie-{idx+1:03d}"))
+                    current_act = ch_act
+
+                # Add header illustration page before chapter if present
+                if ch.get('header_id'):
+                    spine_items.append(SpineItem(idref=ch['header_id']))
+                spine_items.append(SpineItem(idref=ch['id']))
+        else:
+            # === SINGLE-VOLUME SPINE (original behavior) ===
+            for i in range(len(kuchie_list)):
+                spine_items.append(SpineItem(idref=f"kuchie-{i+1:03d}"))
+
+            # Pre-TOC content (front plates, premise pages) renders ahead of the
+            # table of contents even though it is not listed in the contents.
+            for ch in chapter_info:
+                if not ch.get('pre_toc'):
+                    continue
+                if ch.get('header_id'):
+                    spine_items.append(SpineItem(idref=ch['header_id']))
+                spine_items.append(SpineItem(idref=ch['id']))
+
+            # TOC page
+            spine_items.append(SpineItem(idref="toc-page"))
+
+            # Chapters (pre-TOC content was placed above)
+            for ch in chapter_info:
+                if ch.get('pre_toc'):
+                    continue
+                # Add header illustration page before chapter if present
+                if ch.get('header_id'):
+                    spine_items.append(SpineItem(idref=ch['header_id']))
+                spine_items.append(SpineItem(idref=ch['id']))
+
+        # Generate OPF
+        opf_gen = OPFGenerator()
+        opf_gen.generate(
+            paths.package_opf,
+            book_metadata,
+            all_items,
+            spine_items,
+            cover_image_id
+        )
+
+    def _update_manifest(
+        self,
+        work_dir: Path,
+        output_filename: str,
+        chapter_count: int,
+        image_count: int
+    ) -> None:
+        """Update manifest with build status."""
+        manifest_path = work_dir / "manifest.json"
+
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            manifest = json.load(f)
+
+        manifest['pipeline_state']['builder'] = {
+            'status': 'completed',
+            'timestamp': datetime.now().isoformat(),
+            'output_file': output_filename,
+            'chapters_built': chapter_count,
+            'images_included': image_count
+        }
+
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+
+def run_builder(
+    volume_id: str,
+    output_filename: Optional[str] = None,
+    work_base: Optional[Path] = None,
+    output_base: Optional[Path] = None,
+    skip_qc_check: bool = False,
+    include_header_illustrations: bool = False,
+    dry_run: bool = False,
+    profile: Optional[str] = None,
+    emit_xtc: Optional[str] = None,
+) -> BuildResult:
+    """
+    Main entry point for Builder agent.
+
+    Args:
+        volume_id: Volume identifier
+        output_filename: Optional custom output filename
+        work_base: Optional custom working directory
+        output_base: Optional custom output directory
+        skip_qc_check: Skip critics completion check
+        include_header_illustrations: Keep chapter-opening illustration placeholders
+        dry_run: Assemble the EPUB structure but don't package it or touch
+            manifest.json — see BuilderAgent.build_epub's dry_run docstring.
+        profile: Device profile name. None uses builder.device_profile from
+            config.yaml.
+        emit_xtc: 'xtc' or 'xtch' to additionally render the CrossPoint native
+            format. Requires an xteink-* profile and a configured converter.
+            A failed export never fails the build.
+
+    Returns:
+        BuildResult with status and details
+    """
+    agent = BuilderAgent(work_base, output_base, profile=profile)
+    return agent.build_epub(
+        volume_id,
+        output_filename,
+        skip_qc_check,
+        include_header_illustrations=include_header_illustrations,
+        dry_run=dry_run,
+        emit_xtc=emit_xtc,
+    )
+
+
+# CLI interface
+if __name__ == "__main__":
+    import argparse
+
+    from src.Deepseek.common.config import ensure_utf8_console
+
+    # Runs as its own subprocess (see mcp/servers/builder_server.py's
+    # run_module) with the same Windows charmap-stdout crash risk as
+    # scripts/mtl.py — chapter titles and error text can carry JP. Safe to
+    # touch stdout here: never imported in-process by the MCP server, only
+    # ever run standalone via `-m src.builder.agent`.
+    ensure_utf8_console()
+
+    parser = argparse.ArgumentParser(
+        description="Builder Agent - Assemble EPUB from translated content"
+    )
+    parser.add_argument("volume_id", type=str, help="Volume ID (directory name in WORK/)")
+    parser.add_argument("--output", "-o", type=str, help="Output filename")
+    parser.add_argument("--work-dir", "-w", type=Path, help="Working directory")
+    parser.add_argument("--output-dir", type=Path, help="Output directory")
+    parser.add_argument("--skip-qc", action="store_true", help="Skip QC check")
+    parser.add_argument(
+        "--include-header-illustrations",
+        action="store_true",
+        help="Keep chapter-opening illustration placeholders in chapter XHTML",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Developer flag: assemble the EPUB structure but don't package a .epub "
+             "or touch manifest.json. Assembled OEBPS/ tree is copied to "
+             "WORK/<vol_id>/DRY_RUN/ instead.",
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        choices=list(PROFILE_NAMES),
+        default=None,
+        help="Target device profile (default: builder.device_profile in config.yaml). "
+             "xteink-x3 / xteink-x4 fit images to the panel, convert them to "
+             "grayscale, force baseline JPEG and ship the e-ink stylesheet. "
+             "passthrough reproduces pre-profile output byte for byte.",
+    )
+    parser.add_argument(
+        "--emit-xtc",
+        type=str,
+        choices=list(XTC_FORMATS),
+        default=None,
+        help="Additionally render the CrossPoint native format alongside the "
+             ".epub. Requires an xteink-* profile and builder.xtc configured "
+             "with a converter checkout and a font. Pages are pre-rendered "
+             "bitmaps: roughly 10x the file size, and the reader can no longer "
+             "change font or text size. A failed render never fails the build.",
+    )
+
+    args = parser.parse_args()
+
+    result = run_builder(
+        volume_id=args.volume_id,
+        output_filename=args.output,
+        work_base=args.work_dir,
+        output_base=args.output_dir,
+        skip_qc_check=args.skip_qc,
+        include_header_illustrations=args.include_header_illustrations,
+        dry_run=args.dry_run,
+        profile=args.profile,
+        emit_xtc=args.emit_xtc,
+    )
+
+    if result.success and result.dry_run:
+        print(f"\nDry run complete — no .epub packaged: {result.debug_dir}")
+    elif result.success:
+        print(f"\nEPUB built successfully: {result.output_path}")
+    else:
+        print(f"\nBuild failed: {result.error}")
+        exit(1)

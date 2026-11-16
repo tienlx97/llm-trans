@@ -1,0 +1,1511 @@
+# ============================================================================
+# LLM Translator — Master Configuration
+# Lightweight translation client with selectable DeepSeek and Qwen providers.
+# ============================================================================
+
+# ── Project Identity ────────────────────────────────────────────────────────
+project:
+  # Default target for NEW workspaces (`--target` on the CLI overrides it).
+  # Each workspace records its own language at extraction time, so changing
+  # this never re-routes a volume that already exists.
+  target_language: en
+  name: LLM Translator
+  version: 1.0.0
+
+  # Target languages besides English. English needs no entry: it keeps the
+  # historical EN/ layout and each provider's own translation.<provider>.master_prompt.
+  # A language lists only the providers that have a real route for it; any
+  # other provider is refused before an API call (no silent English output).
+  languages:
+    vi:
+      language_name: Vietnamese
+      language_code: vi            # dc:language / xml:lang in the built EPUB
+      output_suffix: _VI           # output/<title>_VI.epub
+      providers:
+        openai:
+          master_prompt: src/prompts/vi/master_prompt_light_novel_vi.md
+        gemini:
+          master_prompt: src/prompts/vi/master_prompt_light_novel_vi.md
+        codex:                     # Codex CLI, ChatGPT plan (see cli: below)
+          master_prompt: src/prompts/vi/master_prompt_light_novel_vi.md
+        claude:                    # Claude Code, Claude plan (see cli: below)
+          master_prompt: src/prompts/vi/master_prompt_light_novel_vi.md
+      # Vietnamese Series Bible: characters, relationship/pronoun matrix,
+      # glossary. Per volume: work/<vol>/.context/bible_vi.json. Per series:
+      # bibles/<series_id>/vi/bible_vi.json — never the English bible files.
+      bible:
+        # Seed the volume bible from context.xml after prep (no API call).
+        auto_seed: true
+        # Run the LLM relationship/pronoun analysis after seeding during
+        # `run`/`resume`. Off by default: it is an extra paid call per volume.
+        auto_analyze: false
+        # Characters/terms injected per chapter are only those whose JP
+        # surface occurs in that chapter's source (keeps prompts focused and
+        # avoids leaking later-chapter information).
+        max_entries_per_chapter: 60
+      qc:
+        # Deterministic checks always run. The LLM reviewer (semantic checks:
+        # negation, quantities, time, causality, speaker, invented detail,
+        # naturalness) runs only with `mtl qc <vol> --llm`.
+        segment_chars: 2500          # JP characters per LLM QC segment
+        block_on_severity: critical  # QC fails at or above this severity
+      dialogue_style: quotes         # quotes = “…” | dash = — …
+
+# ── LLM assistant for Vietnamese bible analysis, semantic QC and repair ─────
+# One-shot JSON calls through the provider's native API (OpenAI Responses /
+# Gemini generateContent). model: null reuses translation.<provider>.model.
+assistant:
+  provider: openai                   # openai | gemini | codex | claude
+  model: null
+  max_output_tokens: 16000
+  max_retries: 3
+  timeout_seconds: 600
+
+# ── Subscription CLIs: Codex CLI and Claude Code ────────────────────────────
+# `--provider codex|claude` (translate/run/resume), `--prep-provider`,
+# prep.provider and assistant.provider can drive the official CLIs instead of
+# an API: `codex exec` signed in with a ChatGPT plan (`codex login`) or
+# `claude -p` signed in with a Claude plan (`claude`, then /login). Usage
+# counts against that plan's limits; when a limit is hit the run stops
+# cleanly and `resume` continues later. Personal use with your own account.
+# model: null = the CLI's own default (e.g. claude: sonnet | opus | full id;
+# codex: a model your plan offers). Each call runs in an empty temp dir with
+# no tools (Claude) / a read-only sandbox (Codex).
+cli:
+  max_retries: 2                     # transient failures only; plan limits stop at once
+  subscription_only: true            # do not pass *_API_KEY env vars to the CLI
+  max_chunk_chars: 9000              # longer chapters are split at paragraph boundaries
+  previous_tail_chars: 1200          # continuity: ending of the previous chapter/part
+  timeout_seconds: 1800              # per call
+  prep_timeout_seconds: 3600         # prep sends the volume (or its opening) in one call
+  prep_max_chars: 120000             # longer volumes: prep reads only the opening chapters;
+                                     # the VI bible analysis then covers the whole volume
+  claude:
+    executable: null                 # null = `claude` on PATH
+    model: null
+    effort: null                     # low | medium | high | xhigh | max
+    max_output_tokens: 64000
+  codex:
+    executable: null                 # null = `codex` on PATH
+    model: gpt-6.1-terra             # id, not the display name (see ~/.codex/models_cache.json)
+    effort: medium                     # model_reasoning_effort: low | medium | high | xhigh
+
+# ── Web novel import (Syosetu / Kakuyomu) ───────────────────────────────────
+# robots.txt is always honoured; there is no switch to disable it. Pages
+# behind login, age gates, CAPTCHAs or paywalls are not fetched.
+web_import:
+  cache_dir: raw/web/                # per-work checkpoint + episode cache
+  min_delay_seconds: 2.0             # politeness delay between requests
+  timeout_seconds: 30
+  max_retries: 3
+  user_agent: "llm-LN-translator/1.0 (personal translation tool; respects robots.txt)"
+
+# ── File System Paths ───────────────────────────────────────────────────────
+paths:
+  input_dir: raw/          # Source EPUBs for extraction
+  work_dir: work/           # Per-volume working directories
+  output_dir: output/       # Final assembled EPUBs
+  prompt_dir: src/Deepseek/prompt/   # Master translation prompts
+  log_dir: logs/            # Debug and cost logs
+
+# ── MCP Phase Routing (optional) ────────────────────────────────────────────
+# Overrides for src/mcp/harness.py's phase-name -> MCP-tool-name map, exposed
+# over MCP as the routing://phases resource. Every phase already has a
+# sensible built-in default (see harness.py::DEFAULT_PHASE_ROUTES) — this
+# section only needs entries you actually want to change, e.g. pointing
+# "translate" at a future parallel-translation tool without touching code.
+# phase_routing:
+#   translate: run_translator
+
+# ── Prep (Cached Multi-turn Context Build) ──────────────────────────────────
+# One persisted DeepSeek conversation fills 16 generated blocks as JSON nodes;
+# the Librarian-owned opf_metadata block makes 17 prep data blocks in total.
+# The final JSON-to-XML assembly is deterministic and atomic.
+# No Gemini, ChromaDB, or main-pipeline subprocess is involved.
+prep:
+  # deepseek runs the cached multi-turn path (with the unified and parallel
+  # paths as selectable recovery routes); openai runs the Responses route
+  # below. Any other value is refused rather than falling through.
+  provider: openai                 # deepseek | openai | codex | claude
+
+  # OpenAI Responses prep route. It reuses the DeepSeek prep prompt's block
+  # schemas and JSON-node output contract, then submits every active prep block
+  # as one request in a durable OpenAI Batch job. Set batch.enabled to false
+  # for the same block loop through synchronous Responses calls.
+  openai:
+    model: gpt-6-sol
+    endpoint: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    organization_env: OPENAI_ORG_ID
+    project_env: OPENAI_PROJECT_ID
+    prompt: src/Deepseek/prompt/prep_prompt_deepseek_en.xml
+    http_timeout_seconds: 600
+    generation:
+      max_output_tokens: 128000
+      service_tier: default
+      text:
+        verbosity: high
+    reasoning:
+      mode: standard
+      effort: xhigh
+      context: current_turn
+      summary: null
+      include_encrypted_content: true
+    caching:
+      mode: explicit
+      ttl: 30m
+    batch:
+      enabled: false
+      completion_window: 24h
+      poll_seconds: 60
+      max_wait_seconds: 86400
+      max_attempts: 2
+      resume_completed_blocks: true
+      persistence_file: .context/openai_prep_batch_state.json
+
+  # DeepSeek recovery-path defaults. Read only when prep.provider is deepseek.
+  model: deepseek-flash
+  endpoint: https://api.deepseek.com/anthropic
+  api_key_env: DEEPSEEK_API_KEY
+  prompt: src/Deepseek/prompt/prep_prompt_deepseek_en.xml
+  max_output_tokens: 384000
+  thinking_budget: 48000              # DeepSeek prep fallback default
+  effort: high                       # output_config.effort for every prep
+                                       # Pro call (unified path's single call,
+                                      # and the parallel path's phase1_pro_root)
+  http_timeout_seconds: 900
+  # Where cross-volume series bibles live. Sequel detection: if
+  # bible_dir/<series_id>/ exists, prep_volume loads it first and injects
+  # the accumulated term_lock/verbatim_anchors/voice_fingerprints so DeepSeek
+  # has continuity context instead of reinventing names from scratch.
+  bible_dir: bibles/
+
+  # ── Web Search Lock (metadata_localization / blk-17) ─────────────────────
+  # Prep's web-search tool is URL-LOCKED: every grounding query for author /
+  # illustrator / publisher / title must be scoped to locked_url, built from
+  # keyword_format. Mirrors the Web Search Lock in .github/agents/mtl-prep.agent.md
+  # and blk-17-metadata-localization.agent.md — this is the config-layer
+  # declaration of record so the CLI/agent prep path reads the same lock.
+  web_search:
+    enabled: true
+    # The first provider preserves the exact Bookwalker URL contract. The
+    # remaining providers are discovery/corroboration fallbacks only.
+    providers:
+      - bookwalker_direct
+      - brave
+      - ndl
+      - serpapi
+      - tavily
+      - exa
+    locked_url: https://bookwalker.jp/search/?qcat=&word=
+    keyword_format: "[Japanese title] + [Author in Japanese] + Bookwalker"
+    allowed_hosts:
+      - bookwalker.jp
+      - ndlsearch.ndl.go.jp
+    timeout_seconds: 20
+    max_results: 5
+    # Values are environment-variable names, never credentials.
+    api_key_env:
+      brave: BRAVE_SEARCH_API_KEY
+      serpapi: SERPAPI_API_KEY
+      tavily: TAVILY_API_KEY
+      exa: EXA_API_KEY
+    endpoints:
+      brave: https://api.search.brave.com/res/v1/web/search
+      ndl: https://ndlsearch.ndl.go.jp/api/sru
+      serpapi: https://serpapi.com/search.json
+      tavily: https://api.tavily.com/search
+      exa: https://api.exa.ai/search
+    tavily_search_depth: basic
+    tavily_exact_match: true
+
+  # ── Parallel Cache-Warmed Prep (PARALLEL_PREP_GUIDE.md) ───────────────────
+  # Alternative to the single unified Pro call above: one Pro call extracts
+  # character_roster + name_map (establishes the JP-chapters prefix in
+  # DeepSeek's disk cache), one sequential Flash call warms that cache, then
+  # 12 more Flash calls fire in parallel — each returning one small block
+  # instead of the unified path re-echoing the whole ~50K-token document.
+  # First real production run (2026-07-27, ギャルサーの家庭教師になった):
+  # cache-warming confirmed working (95.7% hit ratio on calls 3-14), but
+  # scene_plans truncated at 15,224/16,000 output tokens on a 16-chapter
+  # volume — malformed XML, assembly failed, fallback_to_unified ate the
+  # cost twice over ($0.048 wasted + $0.072 fallback vs. $0.048 if it hadn't
+  # truncated). flash_max_output_tokens raised 16000 -> 32000 in response.
+  parallel:
+    # Disabled while multi_turn is active; the two strategies are mutually
+    # exclusive to prevent a failure from multiplying API spend.
+    enabled: false
+    fallback_to_unified: false         # do not launch a second expensive
+                                        # strategy automatically after failure;
+                                        # keep artifacts for an explicit retry
+    flash_model: deepseek-v4-flash
+    flash_thinking_budget: 32000        # 0 disables extended thinking for
+                                        # Flash calls entirely. Must stay
+                                        # below flash_max_output_tokens —
+                                        # budget_tokens counts against the
+                                        # same ceiling as the block output.
+    flash_max_output_tokens: 384000     # each call returns ONE block, not
+                                        # the whole document, but the verbose
+                                        # blocks (scene_plans, eps_arc_tracker,
+                                        # cultural_glossary) ran 12-15K tokens
+                                        # on a 16-chapter volume with only
+                                        # 16000 to work with — see the incident
+                                        # note above. 32000 gives real headroom
+                                        # without meaningfully raising cost on
+                                        # the cheap blocks (validation_audit
+                                        # used all of 626).
+    flash_effort: max                 # output_config.effort for every Flash
+                                        # call in Phase 2 (warming + parallel)
+    warming_block: voice_fingerprints  # which block the lone sequential
+                                        # cache-warming call (Phase 2a) fills
+    max_concurrent_flash_calls: 20    # well under Flash's documented 2500
+                                        # concurrent-request ceiling
+
+  # ── Multi-turn Prep with Prefix Cache (src/utility/prep/multiturn_agent.py) ─
+  # Active default: one persisted, sequential DeepSeek conversation, one JSON
+  # node turn per generated block. The fixed system prefix carries the prep
+  # instructions, context shell, full JP source, optional bible, and one-time
+  # metadata-search evidence. Each user turn carries only its block task.
+  # Earlier accepted JSON turns remain visible as locked conversation history;
+  # final JSON-to-XML assembly is deterministic and atomic.
+  #
+  # run_prep() rejects multi_turn + parallel together. Automatic fallback is
+  # disabled by default so malformed output keeps artifacts for explicit retry.
+  multi_turn:
+    enabled: true
+    conversation_kind: prep
+    fallback_to_unified: false   # retain artifacts; retry explicitly to avoid double spend
+    resume_completed_blocks: true # a repeat run re-asks only the turns that never
+                                  # finished. A block is reused when BOTH its
+                                  # <block>.json artifact parses AND the block is
+                                  # still in the persisted conversation history —
+                                  # an artifact whose conversation record is gone
+                                  # (a model/endpoint change resets the prefix) is
+                                  # re-run anyway, so later turns can still see it.
+                                  # `mtl.py prep --force-rerun` overrides per run.
+    flash_model: deepseek-v4-flash
+    thinking_budget: 64000              # 0 disables extended thinking
+    effort: max                        # output_config.effort for every turn
+    max_output_tokens: 384000            # per-block ceiling — one turn returns
+                                         # ONE block's JSON envelope, not the
+                                         # whole document
+    cache_monitor:
+      enabled: true
+      warn_threshold_cache_hit_ratio: 0.70
+
+    # Passed straight to DeepSeekConversationManager as its `config`. Prep's
+    # conversation is short (15 turns, one per block) and the full JP text
+    # only enters once (turn 1) — recent_verbatim_chapters is set >= the turn
+    # count so the compaction ladder stays dormant for a normal-length volume;
+    # it exists as the same safety net the translator relies on, not because
+    # a prep run is expected to need it.
+    conversation:
+      recent_verbatim_chapters: 15
+      checkpoint_trigger_ratio: 0.85
+      soft_notice_ratio: 0.60
+      tool_snip_ratio: 0.70
+      checkpoint_force_ratio: 0.95
+      checkpoint_max_output_tokens: 16000
+      checkpoint_stuck_guard_turns: 2
+      fail_closed_on_checkpoint_error: true
+      persistence_file: .context/deepseek_prep_multiturn_conversation.json
+      cache_user_id: true
+      context_window: 1000000
+
+  # Per-block reasoning archive for the multi-turn conversation — whichever
+  # block was filled — name choices, canon grounding, schema decisions.
+  # Already paid for (reasoning tokens bill as output regardless); archiving
+  # it per block is a free audit trail for the assembler's validation and
+  # LPPM-style review. Mirrors translation.thinking_log.
+  thinking_log:
+    enabled: true
+    output_dir: THINKING              # work/<vol_id>/THINKING/ (prep subdir)
+    capture_reasoning: true           # persist reasoning_details/thinking per block
+
+# ── Translation Pipeline ────────────────────────────────────────────────────
+translation:
+  # ════════════════════════════════════════════════════════════════════════
+  # GENERAL — provider route + shared prompt/log settings. These apply to
+  # whichever provider is selected; provider-specific knobs live in the
+  # `deepseek:`, `qwen:`, `openai:`, and `anthropic:` menus below.
+  # ════════════════════════════════════════════════════════════════════════
+
+  # Phase 2 provider route: deepseek | qwen | openai | anthropic | gemini.
+  provider: anthropic                 # deepseek | qwen | openai | anthropic | gemini | codex | claude
+
+  # Master prompt selection. The base prompt consolidates all 13 RAG module
+  # policies inline — no external RAG modules, ChromaDB, or vector stores
+  # are needed at runtime.
+  #
+  # ROUTING: this key feeds the DEEPSEEK route only (get_master_prompt_path()).
+  # When translation.provider is "qwen", the Qwen client loads its own prompt
+  # from translation.qwen.master_prompt below — this key is ignored then, so
+  # do not point it at the Qwen prompt expecting it to ship.
+  master_prompt: src/Deepseek/prompt/master_prompt_deepseek_en.xml
+
+  # Optional: Use the V2 literacy-anchor variant for sequel volumes that
+  # have prior-volume golden samples in context.xml.  The prompt loader
+  # auto-selects this when context.xml contains <prior_volume_anchors>.
+  master_prompt_v2: src/Deepseek/prompt/master_prompt_deepseek_en_v2.xml
+
+  # ── Thinking Log ────────────────────────────────────────────────────────────
+  # DeepSeek V4 Pro's reasoning_content shows WHY it made each translation
+  # choice — character voice targeting, structural constraints considered.
+  # It's already paid for (reasoning tokens are billed as output regardless);
+  # saving it per chapter is a free audit trail. ON by default. Leaked
+  # <thinking> blocks are always stripped out of the shipped EN chapter
+  # regardless of this flag — this only controls whether that reasoning gets
+  # archived to a file, not whether the chapter output itself stays clean.
+  thinking_log:
+    enabled: true                # --no-thinking-log on the CLI overrides this to false
+    output_dir: THINKING         # Relative to the volume's work dir: work/<vol_id>/THINKING/
+
+    # ── THINKING Density Map (translator-only telemetry) ────────────────────
+    # Rebuilt after every chapter from every THINKING/*.md file on disk —
+    # measures how much of context.xml's canon graph each chapter's silent
+    # reasoning actually referenced (which blocks, which characters) against
+    # how long that reasoning ran. See src/translator/thinking_density.py.
+    # Meaningless with thinking_log.enabled: false (nothing to analyze), so
+    # this is skipped automatically in that case regardless of this flag.
+    density_map:
+      enabled: true
+
+  # ════════════════════════════════════════════════════════════════════════
+  # DEEPSEEK ROUTE MENU — read by src/Deepseek/translator/config.py when
+  # provider: deepseek. Mirrors the qwen: menu below.
+  # ════════════════════════════════════════════════════════════════════════
+  deepseek:
+
+    # ── Model & Connection ──────────────────────────────────────────────────
+    # DeepSeek V4 Pro (~$0.435/$0.87 per MTok input/output, 75% discount).
+    # Switch to deepseek-v4-flash for ~3× cheaper throughput ($0.14/$0.28).
+    model: deepseek-v4-pro              # deepseek-v4-pro | deepseek-v4-flash
+
+    # Anthropic-compatible Messages endpoint. DeepSeek's native /anthropic
+    # path supports the full Messages API including thinking, streaming,
+    # and auto-prefix caching. Do NOT change to /v1 (OpenAI format) — the
+    # bare client exclusively uses the Anthropic SDK route.
+    endpoint: https://api.deepseek.com/anthropic
+
+    # Environment variable holding the API key.
+    api_key_env: DEEPSEEK_API_KEY
+
+    # HTTP timeout for single API call (seconds).  600 = 10 minutes,
+    # which covers the worst-case 384K-output chapter with thinking.
+    http_timeout_seconds: 600
+
+    # ── Generation ──────────────────────────────────────────────────────────
+    generation:
+      # DeepSeek V4 output ceiling: 384K tokens. The 1M context window
+      # minus a generous margin for the system prompt (~200K in the
+      # consolidated master prompt) and conversation history.
+      max_output_tokens: 384000
+
+      # Nucleus sampling.  0.95 = moderately creative; lower for more
+      # deterministic output.  Irrelevant when thinking is enabled
+      # (temperature is omitted entirely in thinking mode).
+      top_p: 0.95
+
+      # Temperature is intentionally absent from this config. DeepSeek
+      # rejects temperature when thinking mode is active. The client
+      # automatically omits it when building the API request.
+
+    # ── Thinking / Reasoning ────────────────────────────────────────────────
+    thinking:
+      # Master toggle. When disabled, the client skips the thinking
+      # budget and output_config.effort fields entirely.
+      enabled: true
+
+      # Token budget allocated per turn for DeepSeek's internal chain-
+      # of-thought (CoT). Rendered as `thinking.budget_tokens` in the
+      # Anthropic-format request.  48K is the production value; reduce
+      # to 16K for COLD-band chapters if using per-chapter budget routing
+      # (not implemented in the bare client — DRDI is the primary
+      # reasoning control instead).
+      budget_tokens: 64000
+
+      # Anthropic-format effort level. DeepSeek ignores this at the API
+      # level (it has no native effort routing), but the client still
+      # sends it in output_config for forward-compatibility if DeepSeek
+      # ever adds server-side effort support. The actual per-chapter
+      # reasoning intensity is controlled via DRDI (see below).
+      effort: xhigh                         # max | xhigh/high | medium | low
+
+    # ── Auto-Prefix Cache ───────────────────────────────────────────────────
+    caching:
+      # DeepSeek automatically caches the longest stable byte-prefix of
+      # each request — no cache_control markers needed. The system prompt
+      # + context.xml form the stable prefix; per-chapter DRDI + DOVB
+      # go into the user turn so they don't break the cache.
+      enabled: true
+
+      # Monitor prefix stability and cache hit ratio per chapter.
+      # Logs a warning when the hit ratio drops below this threshold.
+      cache_monitor:
+        enabled: true
+        warn_threshold_cache_hit_ratio: 0.70   # warn below 70% hits
+
+      # Track thinking_content token count vs EPS intensity for
+      # cost/quality analytics.  Writes per-chapter metrics to the
+      # conversation state file.
+      thinking_analytics:
+        enabled: true
+
+    # ── Persistent Conversation ─────────────────────────────────────────────
+    conversation:
+      # When enabled, the translator maintains a persistent, append-only
+      # conversation transcript across chapters. This gives DeepSeek
+      # long-context awareness of prior-chapter translation decisions,
+      # character voice consistency, and plot continuity.
+      #
+      # Disable for fully independent per-chapter translation (useful
+      # for testing or when the prompt already carries sufficient context).
+      enabled: true
+
+      # Number of most-recent chapters to include verbatim (full JP + EN
+      # pair) in each turn. Older chapters are summarized into a
+      # continuity checkpoint. 2 is the production value — trimmed from 3
+      # to improve cache hit ratio (~82% → ~86% on typical volumes) without
+      # meaningful loss of translation-memory context.
+      recent_verbatim_chapters: 2
+
+      # Include the EXACT JP source text of recent chapters in the user
+      # turn (not just the EN output). Enables DeepSeek to cross-reference
+      # its own prior translations against the source. Keep enabled.
+      include_exact_jp_task: true
+
+      # Persistence file written to <work_dir>/.context/.
+      persistence_file: .context/deepseek_conversation.json
+
+      # ── Compaction Ladder ─────────────────────────────────────────────────
+      # As the conversation grows, the prefix approaches the 1M context
+      # window. The compaction ladder applies progressively cheaper
+      # measures BEFORE the expensive checkpoint summarizer fires:
+      #
+      #   soft_notice (lowest)  → log only; no mutation, no cost.
+      #   tool_snip              → drop stale tool round-trips from old
+      #                            turns outside the recent-verbatim window.
+      #   checkpoint (trigger)   → generate a compressed continuity XML
+      #                            summary via a paid API call. Resets the
+      #                            prefix cache (cold start on next turn).
+      #   force                  → override the stuck guard. Must stay
+      #                            strictly below 1.0.
+      #
+      # Each ratio is clamped against its neighbour at load time so a bad
+      # config edit cannot invert the ladder.
+
+      # Fraction of context window at which the paid checkpoint fires.
+      # 0.85 = checkpoint when 85% full.
+      checkpoint_trigger_ratio: 0.85
+
+      # Max tokens for the checkpoint summarizer's own output.
+      checkpoint_max_output_tokens: 32000
+
+      # If the checkpoint fires on this many consecutive turns, pause
+      # automatic checkpointing so the prefix cache can warm again.
+      # A checkpoint destroys the cached prefix; back-to-back checkpoints
+      # mean the cache never recovers. 2 = standard guard; 0 = disable.
+      checkpoint_stuck_guard_turns: 2
+
+      # Compaction ladder rungs (fraction of context window):
+      soft_notice_ratio: 0.60             # log warning, no action
+      tool_snip_ratio: 0.70               # remove stale tool round-trips
+      checkpoint_force_ratio: 0.95        # override stuck guard
+
+      # If the checkpoint summarizer itself fails (API error), should the
+      # translation fail closed (abort) or continue without a checkpoint?
+      # true = abort (safe); false = continue (risks context overflow).
+      fail_closed_on_checkpoint_error: true
+
+    # ── Output Continuation ─────────────────────────────────────────────────
+    # When a chapter's response is cut off by the per-turn output cap
+    # (stop_reason=max_tokens — which on this endpoint counts reasoning
+    # tokens against the same budget as the translation text), the
+    # translator issues follow-up calls that continue the translation from
+    # exactly where the previous output stopped, instead of shipping a
+    # truncated chapter. `max_continuations` caps how many follow-up calls
+    # one chapter may take; the partial result is used if the cap is hit.
+    continuation:
+      enabled: true
+      max_continuations: 3
+
+    # ── DeepSeek-Specific Optimizations ─────────────────────────────────────
+    optimizations:
+
+      # DRDI — DeepSeek Reasoning Directive Injection.
+      # DeepSeek ignores the Anthropic `effort` parameter, so DRDI injects
+      # EPS-band CoT scaffolding directly into the user turn. Each EPS
+      # band (HOT/WARM/NEUTRAL/COOL/COLD) maps to a prose reasoning
+      # directive that tells DeepSeek how deeply to think about the scene.
+      #
+      # Disable for baseline throughput testing or when running Flash
+      # with fixed reasoning budget.
+      drdi:
+        enabled: true
+
+      # DOVB — DeepSeek-Optimized Voice Block.
+      # Generates template-style voice representations tailored to
+      # DeepSeek's reasoning style: explicit contraction rewrite rules,
+      # forbidden vocabulary lists, speech register templates, and
+      # character archetype anchors (tsundere, kuudere, etc.).
+      #
+      # When disabled, character voice guidance comes only from whatever
+      # is baked into context.xml and the master prompt.
+      dovb:
+        enabled: true
+
+      # CCT — Concurrent Chapter Translation.
+      # Async chapter processor for parallel translation. NOT wired into
+      # the default sequential flow — this is an opt-in escape hatch for
+      # users who want parallelism despite the conversation-history cost.
+      # DeepSeek conversation is ordered and append-only; concurrent
+      # chapters cannot share conversation state.
+      concurrent_chapters:
+        enabled: true
+        max_concurrent: 3                  # forced to 1 for safety
+
+    # ── Streaming ───────────────────────────────────────────────────────────
+    streaming:
+      # Stream text_delta and thinking_delta events as they arrive.
+      # When disabled, the client waits for the full response.
+      enabled: true
+
+    # ── Post-Processing ─────────────────────────────────────────────────────
+    post_processing:
+      # Format scene breaks (＊  ＊  ＊ → centered asterism, etc.).
+      scene_break_formatting: false
+
+      # Strip CJK artifact characters that leak into EN output (fullwidth
+      # parentheses, CJK punctuation, ideographic spaces).
+      cjk_cleanup: false
+
+      # Salvage chapters accidentally emitted into reasoning_content
+      # instead of content (known DeepSeek API edge case).
+      salvage_reasoning_leaked_answer: true
+
+    # ── Retry & Resilience ──────────────────────────────────────────────────
+    retry:
+      max_retries: 5
+      base_delay_ms: 500
+      max_delay_ms: 32000
+      jitter_factor: 0.25
+      # 529 Overloaded: don't retry indefinitely. 3 is production value.
+      max_529_retries: 3
+
+  # ════════════════════════════════════════════════════════════════════════
+  # QWEN ROUTE MENU — read by src/Qwen/config.py when provider: qwen.
+  # Mirrors the deepseek: menu above.
+  # ════════════════════════════════════════════════════════════════════════
+  qwen:
+    model: qwen3.7-max
+    endpoint: https://dashscope-intl.aliyuncs.com/apps/anthropic
+    api_key_env: DASHSCOPE_API_KEY
+    http_timeout_seconds: 600
+
+    # Master prompt for the Qwen route. Read by src/Qwen/config.py::
+    # get_qwen_prompt_path() whenever translation.provider is "qwen" — the
+    # general translation.master_prompt key above belongs to the DeepSeek
+    # route and is never consulted by the Qwen client. Swap this path to
+    # point the Qwen route at a different prompt without touching code.
+    master_prompt: src/Qwen/prompts/master_prompt_qwen_en.xml
+    generation:
+      # Official Qwen frontier-class rule: when thinking is enabled,
+      # max_tokens must exceed thinking.budget_tokens (shared budget for
+      # reply + CoT). Applies to every *-max model, not one version of it.
+      max_output_tokens: 128000
+      top_p: 0.95
+    thinking:
+      enabled: true
+      budget_tokens: 56000
+      # Anthropic-compatible multi-turn preserves thinking by returning
+      # prior assistant thinking blocks in conversation history (not a
+      # request header). preserve_thinking is NOT supported on this route
+      # — the conversation manager strips thinking blocks from stored
+      # assistant content instead, matching Qwen's documented rule:
+      # "retain only the content field and ignore reasoning_content."
+    caching:
+      enabled: true
+      explicit: true                 # cache_control markers on system + latest user
+      ttl_minutes: 5                 # official explicit-cache validity window
+      cache_monitor:
+        enabled: true
+        warn_threshold_cache_hit_ratio: 0.70
+    streaming:
+      enabled: true                  # recommended for long thinking turns
+    conversation:
+      enabled: true
+      recent_verbatim_chapters: 2
+      include_exact_jp_task: true
+      persistence_file: .context/qwen_conversation.json
+      context_window: 1000000
+      soft_notice_ratio: 0.60
+      compact_ratio: 0.75
+      hard_trim_ratio: 0.90
+    continuation:
+      enabled: true
+      max_continuations: 3
+      # Official Partial Mode is incompatible with thinking. When true and
+      # thinking is on, the client disables thinking for the continuation turn
+      # and uses assistant partial=true prefix continuation.
+      use_partial_mode: true
+    retry:
+      max_retries: 5
+      base_delay_ms: 500
+      max_delay_ms: 32000
+      jitter_factor: 0.25
+      max_429_retries: 3
+    optimizations:
+      eps_guidance: true
+      voice_block: true
+      partial_prefix: true
+
+  # ════════════════════════════════════════════════════════════════════════
+  # OPENAI RESPONSES ROUTE MENU — read by src/OpenAI/config.py when
+  # provider: openai. The client uses the native OpenAI Responses API.
+  # ════════════════════════════════════════════════════════════════════════
+  openai:
+    # GPT-6 Sol is the primary literary route; Astra remains selectable.
+    # GPT-6 Luna is the lower-cost operational fallback.
+    model: gpt-6-sol
+    endpoint: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    organization_env: OPENAI_ORG_ID
+    project_env: OPENAI_PROJECT_ID
+    http_timeout_seconds: 600
+    master_prompt: src/OpenAI/prompts/master_prompt_openai_en.md
+
+    # Shared categorical chapter-risk metadata is consumed by every provider.
+    # GPT-6 turns a changed signal profile into a Responses
+    # configuration_update item in reasoning.mode=standard.
+    chapter_signals:
+      enabled: true
+
+    # An exhausted availability/transport failure switches at a clean chapter
+    # boundary and pins the selected route in the volume ledger.
+    fallback:
+      enabled: true
+      model: gpt-6-luna
+      master_prompt: src/OpenAI/prompts/master_prompt_openai_en.md
+      allow_mixed_model_volume: true
+      resume_pending: true
+
+    routing:
+      persistence_file: .context/openai_route.json
+
+    generation:
+      # Includes both visible output and reasoning tokens.
+      max_output_tokens: 128000
+      service_tier: default            # auto | default | flex | scale | priority | fast — NEVER "standard", that literal does not exist in this enum
+      text:
+        verbosity: high
+
+    reasoning:
+      # Keep the standard model mode unless an operator explicitly selects
+      # pro. Effort is independent and defaults to the maximum literary pass.
+      mode: standard                 # standard | pro
+      effort: max                    # none | minimal | low | medium | high | xhigh | max
+      context: all_turns             # auto | current_turn | all_turns
+      include_encrypted_content: true
+
+      # Reasoning summary text (a model-generated PARAPHRASE of its
+      # reasoning, not the raw chain-of-thought — OpenAI never exposes raw
+      # reasoning tokens via the API). This is the ONLY thing that can ever
+      # populate THINKING/<chapter>_THINKING.md for this route; without it
+      # the request never asks for summary text and the log writer silently
+      # writes nothing, every chapter, regardless of thinking_log.enabled.
+      # Two dependencies outside this config's control: (1) the API account
+      # must complete OpenAI's organization verification before summarizers
+      # are returned at all — see
+      # https://help.openai.com/en/articles/10910291-api-organization-verification
+      # (2) summary support can vary by model and account. Set to null to
+      # stop requesting a summary entirely.
+      summary: detailed                  # auto | concise | detailed | null
+
+    caching:
+      # GPT-6 explicit cache breakpoints support the 30-minute TTL.
+      mode: explicit                 # explicit | implicit | disabled
+      ttl: 30m
+      cache_monitor:
+        enabled: true
+        # Explicit-only mode intentionally caches the fixed developer prefix,
+        # not the entire rolling two-chapter request. Breakpoint recovery is
+        # the health signal; total coverage remains a cost metric.
+        warn_threshold_breakpoint_success_rate: 0.90
+        warn_threshold_prefix_recovery: 0.90
+        min_repeat_calls_before_warning: 2
+
+    # ── Batch API ────────────────────────────────────────────────────────────
+    # Batch is the default for the whole GPT-6 family; disable this switch to
+    # force synchronous Responses calls for a selected run.
+    batch:
+      enabled: true
+      # Every request in a wave is built against one frozen conversation
+      # prefix. Lower this for stronger chapter-to-chapter awareness; raise it
+      # for throughput at the cost of sibling requests being mutually blind.
+      wave_size: 4
+      # A fresh volume starts with one request wave of one so later waves see a
+      # committed translation. Set seed_chapters: 0 to accept a blind first
+      # wave deliberately.
+      seed_chapters: 1
+      seed_via_batch: true
+      poll_seconds: 60
+      completion_window: 24h
+      persistence_file: .context/openai_batch_state.json
+
+    streaming:
+      enabled: true
+
+    conversation:
+      # Responses are replayed locally; store:false avoids relying on remote
+      # response state. Complete raw output items, including encrypted
+      # reasoning, are preserved in this ledger for valid next-turn replay.
+      enabled: true
+      store: false
+      persistence_file: .context/openai_conversation.json
+      recent_verbatim_chapters: 2
+      context_window: 1050000
+      max_input_tokens: 922000
+      max_verbatim_chapters: 8
+      verbatim_ceiling_ratio: 0.60
+      previous_chapter_tail_chars: 1200
+      summary_head_chars: 240
+      summary_tail_chars: 480
+      soft_notice_ratio: 0.60
+      compact_ratio: 0.75
+      hard_trim_ratio: 0.90
+
+    continuation:
+      enabled: true
+      max_continuations: 3
+
+    retry:
+      max_retries: 5
+      base_delay_ms: 500
+      max_delay_ms: 32000
+      jitter_factor: 0.25
+      max_429_retries: 3
+
+    optimizations:
+      eps_guidance: true
+      voice_block: true
+
+  # ════════════════════════════════════════════════════════════════════════
+  # ANTHROPIC (CLAUDE) ROUTE MENU — read by src/Anthropic/config.py when
+  # provider: anthropic. Uses the real Anthropic Messages API directly
+  # (not an Anthropic-compatible passthrough the way DeepSeek/Qwen do).
+  #
+  # Scoped, deliberately, to the current Claude-5 family that shares one
+  # capability profile end to end: claude-opus-5-5 (default), claude-sonnet-5-5,
+  # claude-sonnet-5, claude-opus-5, claude-fable-5-1 — all five adaptive-thinking-only,
+  # 1M context, 128K max output, and a hard 400 on any non-default
+  # temperature/top_p/top_k regardless of thinking state. Claude Haiku 4.5
+  # (the one current-family model still on manual budget_tokens thinking,
+  # 200K context, 64K output) is out of scope for this route by design, not
+  # omission.
+  #
+  # claude-fable-5 was retired here on 2026-09-03 for claude-fable-5-1
+  # (released 2026-09-01): same input/output price, same tokenizer, and cache
+  # reads at $0.25/MTok instead of $1.00 — a quarter of its predecessor's, and
+  # NOT the family's usual 10%-of-input multiplier, so the telemetry table
+  # states it per-model rather than deriving it.
+  #
+  # Fable 5.1, Opus 5.5, and Sonnet 5.5 add "preserved thinking": a thinking
+  # block's signature binds the system prompt and every message ahead of it,
+  # so replaying one after that prefix changed is a 400 before any output.
+  # The conversation ledger handles this by stripping thinking from retained
+  # turns at each compaction boundary — gated on the model id, so
+  # claude-opus-5 and claude-sonnet-5 keep every block exactly as they did
+  # before.
+  #
+  # claude-opus-5-5 (released 2026-09-22, default here since 2026-09-23):
+  # $4/$20 per MTok, cache reads $0.20 (0.05x input), batch $2/$10. Thinking
+  # cannot be disabled at any effort, and its default effort is "medium", not
+  # "high" — so thinking.effort below is always sent explicitly. Source:
+  # platform.claude.com/docs/en/models/opus-5-5/whats-new-opus-5-5
+  #
+  # claude-sonnet-5-5 (released 2026-09-28, added here 2026-09-29 ALONGSIDE
+  # claude-sonnet-5, not in place of it): same $2/$10 per MTok and tokenizer
+  # as claude-sonnet-5. Thinking still turns off, but "disabled" itself is
+  # now a 400 — the replacement is thinking:{type:"between_tools"}, which
+  # only accepts effort low/medium/high (xhigh/max 400s). Its Advisor Mode
+  # compatibility is narrower than claude-sonnet-5's AND mandatorily
+  # encrypted regardless of advisor chosen — the plaintext advisor route
+  # (claude-opus-4-8 or claude-sonnet-5 as advisor) only works against the
+  # claude-sonnet-5 executor. Source: platform.claude.com/docs/en/models/
+  # sonnet-5-5/migration-guide (fetched 2026-09-29)
+  # ════════════════════════════════════════════════════════════════════════
+  anthropic:
+    # Wire id, not the display name: Anthropic model ids never contain a dot.
+    # "claude-fable-5.1" is a hard 404 at request time; the client normalises
+    # it, but write the real id here.
+    # claude-opus-5-5 is the default. Anthropic's advisor-tool compatibility
+    # table still documents no advisor for it (checked 2026-09-23), but the
+    # Opus 5.5 -> Opus 5.5 pairing was confirmed working by live use on
+    # 2026-09-24, so client.py admits exactly that pairing (and no other
+    # advisor) for this executor. claude-sonnet-5-5 (added 2026-09-29
+    # ALONGSIDE claude-sonnet-5, not in place of it) is the executor this
+    # route runs by default here, but its Advisor Mode compatibility is
+    # narrower and mandatorily encrypted -- see ADVISOR_COMPATIBILITY in
+    # client.py. If you want the plaintext advisor route Runs 1-11 validated
+    # (claude-opus-4-8 or claude-sonnet-5 as advisor, readable
+    # advisor_result), set this to claude-sonnet-5 instead: that executor is
+    # still fully supported and untouched by the sonnet-5-5 migration.
+    model: claude-sonnet-5-5      # claude-opus-5-5 | claude-sonnet-5-5 | claude-sonnet-5 | claude-opus-5 | claude-fable-5-1
+    endpoint: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    anthropic_version: "2023-06-01"
+    http_timeout_seconds: 600
+    master_prompt: src/Anthropic/prompts/master_prompt_anthropic_en.md
+
+    generation:
+      # Uniform across all four supported models: 128K is the shared
+      # max-output ceiling. Keep it at the maximum on claude-opus-5-5 in
+      # particular: thinking counts toward max_tokens even when not returned,
+      # and Opus 5.5 thinks more per turn than Opus 5 at the same effort.
+      max_output_tokens: 128000
+      # temperature / top_p / top_k are intentionally absent. Non-default
+      # values on any of them are a hard 400 on every model this route
+      # supports, regardless of thinking state — the client never sends them.
+
+    # ── Adaptive Thinking ────────────────────────────────────────────────────
+    thinking:
+      # Master toggle. claude-fable-5-1 and claude-opus-5-5 reject
+      # thinking:{type:"disabled"} outright (and budget_tokens likewise) —
+      # thinking is always on and the client keeps it on for those models
+      # even if this is set to false. Lower effort instead.
+      #
+      # claude-sonnet-5-5 is different: setting this false does turn thinking
+      # off, but the client sends thinking:{type:"between_tools"} instead of
+      # "disabled" ("disabled" is itself a 400 on this model) -- and that
+      # only works at effort high or below. See BETWEEN_TOOLS_ONLY_MODELS in
+      # client.py if you ever set this false with effort: xhigh or max.
+      enabled: true
+
+      # "summarized" returns readable thinking text (billed the same either
+      # way); "omitted" returns an empty thinking field for faster
+      # time-to-first-text-token. Defaults to "omitted" on the raw API —
+      # set to "summarized" here so THINKING/*.md logs actually capture text.
+      display: summarized              # summarized | omitted
+
+      # output_config.effort — steers reasoning depth in adaptive mode, and
+      # is always sent explicitly. The API default is "high" on every model
+      # here EXCEPT claude-opus-5-5, where it is "medium". Anthropic's Opus 5.5
+      # prompting guide says to start at medium and sweep rather than carry
+      # Opus 5's "high" over: at a given level Opus 5.5 thinks more per turn.
+      # PROVISIONAL until the low/medium/high sweep on this route's own
+      # chapters settles it. Advisor mode requires "high" (client.py).
+      effort: high                   # max | xhigh | high | medium | low
+
+    # ── Prompt Caching ───────────────────────────────────────────────────────
+    caching:
+      enabled: true
+      # 5m is the default TTL (1.25x write / 0.1x read pricing multiplier);
+      # 1h costs 2x on write but survives longer thinking-heavy sessions.
+      ttl: 1h                          # 5m | 1h
+      cache_monitor:
+        enabled: true
+        warn_threshold_cache_hit_ratio: 0.70
+
+    # ── Batch API ────────────────────────────────────────────────────────────
+    # Opt-in async path (src/Anthropic/batch.py): submits every pending
+    # chapter as one Message Batches job instead of translating sequentially.
+    # Never a silent fallback from the synchronous path — a deliberate
+    # cost/latency trade the operator switches on explicitly.
+    batch:
+      enabled: true
+      # The only anthropic-beta header this route ever sends is
+      # advisor-tool-2026-03-01, and only while advisor.enabled is true (sync:
+      # client.py::generate; batch: agent.py, recorded per wave as `betas` in
+      # .context/anthropic_batch_state.json). Nothing else is sent: a beta flag
+      # tied to a dated feature can go stale server-side and turn into a hard
+      # 400 on every request carrying it. Batch requests use the plain 128K
+      # ceiling.
+      # ── Wavefront ─────────────────────────────────────────────────────
+      # Chapters per batch job. Every request in one wave shares a
+      # byte-identical prefix — the cached system blocks plus the
+      # conversation ledger's replayed turns, frozen for that wave — and the
+      # ledger only grows between waves.
+      #
+      # This matters because a batch submits every request before any of them
+      # runs: chapter N cannot carry chapter N-1's translation, since it does
+      # not exist yet. One job per volume therefore translates every chapter
+      # blind to every other. The wave is the dial between the two extremes:
+      #
+      #   1            = the synchronous path's continuity, at batch prices
+      #                  (one job per chapter; slowest, strongest continuity)
+      #   4 (default)  = each chapter sees everything up to its own wave
+      #   >= chapters  = no cross-chapter continuity at all (the old behaviour)
+      #
+      # Raise it for throughput, lower it for fidelity. The shared prefix is
+      # simultaneously the continuity carrier and the cache key, so the 50%
+      # batch discount and the cache-read discount apply to the same bytes.
+      wave_size: 4
+
+      # Chapters translated synchronously before the first wave, to establish
+      # the translation decisions later waves inherit. Only spends when the
+      # ledger is empty (a genuinely fresh volume) — a resumed volume already
+      # has history and skips this. Set 0 to batch from the first chapter and
+      # accept that wave 1 is internally blind.
+      seed_chapters: 1
+
+      # Route the seed through the batch endpoint as its own wave of one.
+      # The seed only has to LAND before the next wave is built, not run
+      # synchronously — a wave of one commits before wave 2's prefix is
+      # assembled, so the continuity invariant above is untouched while the
+      # chapter bills at the 50% batch rate. Measured on Vol.4: the synchronous
+      # seed was $2.06 of a $12.50 volume, 16.5% of the bill for 1,503 words,
+      # purely for taking the sync route. Costs one extra batch round-trip of
+      # latency; set false to get the old immediate-return behaviour.
+      seed_via_batch: true
+
+      # Send each wave's first request alone, let it land, then send the rest.
+      # Every request in a wave carries the same history breakpoint, so exactly
+      # one should WRITE the cached prefix and the rest should read it —
+      # submitted together they race for that write and the loser is billed
+      # too. Measured on Vol.4: CH12/CH13 each wrote 28,693 tokens and
+      # CH18/CH19 each wrote 20,505 — 49,198 duplicate write tokens, 11% of all
+      # writes, $0.49 of the volume. Both were the waves following a
+      # compaction, where the small post-trim prefix tightens the race window.
+      # The remainder is built against the same pre-wave ledger, so its prefix
+      # stays byte-identical and reads what the pilot wrote; wave members are
+      # mutually blind either way.
+      #
+      # auto (default) pilots ONLY the waves built after a compaction — a fold
+      # rewrites the replayed prefix, leaving a cold, small cache entry, and
+      # those were the only waves that actually raced. Waves whose prefix merely
+      # grew never lost the write. On Vol.4 that is 2 waves of 5 rather than 5,
+      # so it recovers the same $0.49 for one extra round-trip instead of five.
+      # always = pilot every wave; never = off.
+      cache_pilot: auto
+
+      poll_seconds: 60
+      completion_window: 24h
+      persistence_file: .context/anthropic_batch_state.json
+
+    # ── Telemetry ───────────────────────────────────────────────────────────
+    # This is the most expensive route in the project. Per-call accounting is
+    # ON by default here, unlike the cheaper providers where it is incidental.
+    #
+    # Each call appends one row to WORK/<vol>/LOG/token_log_<stamp>.md with
+    # fresh / cache-read / cache-write token counts and the actual cost at
+    # today's published rates. Rows are attributed to provider "anthropic" -
+    # before this existed they inherited log_call's "deepseek" default and
+    # were indistinguishable from DeepSeek spend.
+    telemetry:
+      enabled: true
+
+      # The four cache-quality columns: breakpoint success rate, prefix
+      # recovery, total cache coverage, and net cache savings in USD. These
+      # are session-cumulative, so they populate on the synchronous path only;
+      # a batch result belongs to no session and leaves them blank rather than
+      # showing an invented number.
+      #
+      # Watch prefix recovery above all. A cache WRITE costs 1.25x fresh input
+      # (2x at ttl: 1h), so a prefix that keeps missing is more expensive than
+      # not caching at all - the one failure mode that looks like an
+      # optimization while costing more.
+      cache_quality: true
+
+    # ── Proofreading Advisor (advisor_20260301, beta) ───────────────────────
+    # Pairs a faster executor (this route's `model` above) with a
+    # higher-intelligence advisor model consulted mid-generation. Validated
+    # across eleven manual dry runs (docs/anthropic-advisor-mode-plan.md) and
+    # implemented per docs/anthropic-advisor-mode-spec.md: catches real-world
+    # reference validation AND craft/proofreading judgment calls (name-form
+    # drift, locked-anchor collisions, register calls) in a single consult —
+    # not two separate advisor pairings.
+    advisor:
+      enabled: true             # ON for the claude-sonnet-5-5 executor with a
+                                  # claude-sonnet-5-5 advisor (listed pairing).
+                                  # Opus 5.5 -> Opus 5.5 was confirmed by live
+                                  # use (2026-09-24). First test volume: 3e35fe.
+      # The advisor model. Should be on Anthropic's executor/advisor
+      # compatibility table for whichever `model` above is configured (see
+      # ADVISOR_COMPATIBILITY in client.py). An unlisted pairing is NOT
+      # refused: startup logs a warning and the API has the final say (a 400
+      # on the first request if Anthropic really rejects it). Effort below
+      # "high" is the one advisor setting that still fails fast.
+      #   claude-opus-4-8  -- plaintext advisor_result (readable), validated
+      #                       in Runs 8-11. Requires executor claude-sonnet-5
+      #                       (still fully supported, kept for exactly this).
+      #                       claude-sonnet-5-5's migration guide (fetched
+      #                       2026-09-29) explicitly 400s an Opus 4.8 advisor
+      #                       -- so this pairing works ONLY against the
+      #                       claude-sonnet-5 executor, not the -5-5 one.
+      #   claude-sonnet-5  -- same-tier peer; valid with claude-sonnet-5
+      #                       executor (self-pairing, plaintext). NOT valid
+      #                       as an advisor against claude-sonnet-5-5.
+      #   claude-opus-5    -- encrypted advisor_redacted_result; valid for
+      #                       every executor this route supports.
+      #   claude-fable-5-1 -- encrypted; Anthropic's own pick for maximizing
+      #                       quality lift on a Sonnet executor; valid against
+      #                       every documented executor this route supports.
+      #   claude-opus-5-5  -- not in Anthropic's table; admitted ONLY for a
+      #                       claude-opus-5-5 executor (live-confirmed 2026-09-24),
+      #                       and ALSO valid for a claude-sonnet-5-5 executor
+      #                       per that model's own migration guide.
+      # On a claude-sonnet-5-5 executor specifically, advice comes back
+      # encrypted no matter which of these is chosen -- that executor forces
+      # advisor_redacted_result unconditionally (see ADVISOR_COMPATIBILITY's
+      # comment in client.py).
+      # Re-checked against Anthropic's advisor-tool compatibility table on
+      # 2026-10-01: executor claude-sonnet-5-5 accepts Mythos 5.1, Fable 5.1,
+      # Mythos 5, Fable 5, Opus 5.5, Opus 5, and Sonnet 5.5. claude-sonnet-5
+      # (the previous value here) is NOT among them -- a 400 against this
+      # executor. Fable 5.1 is the newest generally listed model in that set
+      # and Anthropic's named pick for lifting a Sonnet executor; Mythos 5.1
+      # is also valid but absent from the public models overview.
+      model: claude-opus-5-5        # claude-opus-4-8 | claude-sonnet-5 | claude-opus-5 | claude-fable-5-1 | claude-opus-5-5 | claude-sonnet-5-5
+      max_tokens: 24000          # validated in Run 8
+      max_uses: 2                # per-request cap (the tool has no per-conversation cap)
+      max_pause_resumes: 2       # resend budget for stop_reason: pause_turn
+      require_signal: true       # wire the tool in only for a chapter carrying
+                                  # an actual chapter_signals risk entry (or
+                                  # subculture_reference, once prep populates
+                                  # it) -- EPS band WARM/HOT alone is NOT
+                                  # sufficient (see optimization.py::build_advisor_guidance
+                                  # and agent.py::_tools_qualify). false restores
+                                  # the uneconomical "any WARM/HOT chapter" gate
+                                  # this session's evidence measured and rejected.
+      caching:
+        enabled: true            # LIVE as of the client.py::build_advisor_tool
+                                  # fix. Sends Anthropic's `caching` field on the
+                                  # advisor tool block: each advisor call writes a
+                                  # cache entry at the TTL below, so later calls in
+                                  # the same conversation read the stable prefix.
+                                  # Omitted entirely when false (per the SDK:
+                                  # "when omitted, the advisor prompt is not
+                                  # cached") -- never sent as null.
+                                  #
+                                  # Why this matters here: before the fix, every
+                                  # advisor call in volume 646941 logged ZERO
+                                  # cache-read tokens across 15 consults while its
+                                  # fresh-token count climbed 75k -> 232k, so the
+                                  # advisor cost MORE than the translation it was
+                                  # advising ($2.31 vs $2.04). Anthropic puts the
+                                  # break-even at ~3 advisor calls per
+                                  # conversation; a volume-length conversation
+                                  # makes 15+, well past it.
+        # ttl: 1h                 # optional override. Unset = inherit the route's
+                                  # caching.ttl (currently 1h), which is what a
+                                  # volume-spanning advisor conversation wants --
+                                  # a 5m default would expire between chapters.
+
+    # ── web_search (basic version, no beta header) ──────────────────────────
+    # Independent of advisor.enabled -- a chapter can need one, the other,
+    # both, or neither (Run 9). Opt-in: its $10/1,000-search cost and the
+    # query-level-economy guardrail (spec §2.5) are unvalidated.
+    web_search:
+      enabled: true
+      type: web_search_20250305  # validated in Run 9; later versions
+                                  # (web_search_20260209+) add dynamic
+                                  # filtering via code execution -- untested here
+      max_uses: 5                # validated in Run 9 (covered every real-world
+                                  # reference in a dense shiritori chapter)
+      require_signal: true       # same gate as advisor.require_signal above
+
+    # ── Fidelity Gate ───────────────────────────────────────────────────────
+    # Deterministic post-translation completeness check, run on every finished
+    # chapter before it is stamped completed in manifest.json. Costs nothing --
+    # no model call, no tokens.
+    #
+    # Why this exists beside Proofreading Mode rather than inside it: the
+    # advisor is consulted BEFORE drafting and never sees the finished prose,
+    # so it structurally cannot verify the output. Volume 6e63bc CHAPTER_04
+    # honoured every verbatim anchor it carried and still shipped without both
+    # of its source's illustration plates (p085.jpg, p121.jpg). Counting is a
+    # job for code; craft judgement is a job for the advisor.
+    fidelity_gate:
+      enabled: true
+      # Which findings refuse the "completed" stamp. A blocked chapter is still
+      # written to EN/ (so it can be read and diffed) but is left pending, so
+      # the next run re-translates it -- the same discipline the batch path
+      # already applies to a MAX_OUTPUT fragment.
+      #   missing    -- a locked anchor the source carried is absent from the English
+      #   drifted    -- a forbidden synonym was used and the locked surface is absent
+      #   structural -- illustration-plate parity between JP and EN broke
+      # missing/drifted are deliberately OUT: a single dropped anchor phrase
+      # among dozens is not worth burning the whole chapter's cache-warmed
+      # advisor consult and re-translating from scratch (volume 25-9's
+      # CHAPTER_02/05/07 all held back for exactly one non-critical anchor
+      # miss each). They are still recorded -- every anchor finding regardless
+      # of blocking status is written to QC/anchor_warnings.md for the QC
+      # pass to weigh -- just no longer fatal on their own. structural stays
+      # blocking: a dropped illustration plate is real content loss, not a
+      # phrasing call. Set to [] to record findings without ever blocking.
+      block_on: [structural]
+      # Advisory-only sentinel (never blocks): how far a chapter's
+      # JP-chars-per-EN-word may stray from the volume's own median before it
+      # is logged as worth a look. Loose on purpose -- translation density
+      # varies honestly with dialogue-to-narration mix, and a two-line omission
+      # cannot move it at all (6e63bc CH04 measured 7.7% while missing content).
+      ratio_tolerance: 0.35
+
+    # ── Streaming ───────────────────────────────────────────────────────────
+    streaming:
+      enabled: true
+
+    # ── Persistent Conversation ─────────────────────────────────────────────
+    conversation:
+      enabled: true
+      # Floor: how many verbatim chapters survive a trim.
+      recent_verbatim_chapters: 2
+      # Ceiling for the append-only replay window. Every retained turn is
+      # replayed each chapter, so the messages prefix grows by appending and
+      # stays byte-stable -- which is the only way the history cache
+      # breakpoint ever registers a read. On passing this ceiling the window
+      # trims in ONE block back to recent_verbatim_chapters, so the prefix is
+      # invalidated once every (max - recent) chapters instead of every single
+      # chapter as a sliding window would.
+      #
+      # This is a COUNT, and on its own it is a poor proxy for the thing that
+      # actually matters (context pressure) -- see verbatim_ceiling_ratio.
+      max_verbatim_chapters: 8
+
+      # Context pressure below which max_verbatim_chapters does NOT trim.
+      #
+      # The count ceiling used to fire unconditionally. Measured on Vol.4 (21
+      # chapters, claude-fable-5-1) it fired twice at roughly 7% window
+      # occupancy and cut the window to two turns each time, folding eighteen
+      # chapters of finished English into one-line excerpts -- while the whole
+      # volume replayed verbatim estimates at 17% of the window below. The
+      # model noticed the loss and translated around it
+      # (WORK/<vol>/THINKING/CHAPTER_03_THINKING.md: "depends on wording I
+      # don't have access to").
+      #
+      # The ceiling now defers to measured pressure: it trims on count only
+      # once the window is at least this full. compact_ratio and
+      # hard_trim_ratio still guard real pressure above it. Set 0.0 to restore
+      # the old unconditional count cap when a hard per-request ceiling is
+      # wanted more than continuity.
+      verbatim_ceiling_ratio: 0.60
+
+      # What survives of a chapter when it IS folded into the summary: this
+      # many characters from its opening, and this many from its ending. The
+      # tail used to be zero -- only the first 240 characters were kept -- so
+      # every callback, cliffhanger, and open scene a chapter handed to the
+      # next one was discarded first. Continuity flows from the ending.
+      summary_head_chars: 240
+      summary_tail_chars: 480
+
+      # Characters of the PRECEDING chapter's ending spliced into a chapter's
+      # envelope when the ledger no longer replays that chapter in full --
+      # after a fold, on a resumed volume, or inside a batch wave. Read from
+      # EN/<prev>_EN.md, which still holds the full text a fold dropped, so
+      # this is continuity at the cost of its own tokens and nothing else.
+      # 0 disables the splice.
+      previous_chapter_tail_chars: 1200
+
+      persistence_file: .context/anthropic_conversation.json
+      context_window: 1000000
+      soft_notice_ratio: 0.60
+      compact_ratio: 0.75
+      hard_trim_ratio: 0.90
+
+    # ── Output Continuation ──────────────────────────────────────────────────
+    continuation:
+      enabled: true
+      max_continuations: 3
+
+    # ── Retry & Resilience ───────────────────────────────────────────────────
+    retry:
+      max_retries: 5
+      base_delay_ms: 500
+      max_delay_ms: 32000
+      jitter_factor: 0.25
+      max_429_retries: 3
+      # Anthropic's distinct overloaded_error/529 — tracked separately from
+      # the general retry ceiling, same reasoning DeepSeek applies to its own.
+      max_529_retries: 3
+
+    optimizations:
+      eps_guidance: true
+      voice_block: true
+
+  # ════════════════════════════════════════════════════════════════════════
+  # GEMINI (src/Gemini) — Google GenAI SDK (google-genai >= 2.3.0)
+  # ════════════════════════════════════════════════════════════════════════
+  # Sync path: Interactions API, one server-side conversation per volume
+  # (previous_interaction_id), implicit caching over it. Batch path:
+  # generateContent Batch API in waves, with an explicit CachedContent per
+  # wave when it pays. Select with translation.provider: gemini.
+  gemini:
+    model: gemini-4-argon          # gemini-4-argon | gemini-3.8-flash | gemini-3.6-flash | gemini-3.1-pro-preview
+    api_key_env: GEMINI_API_KEY      # falls back to GOOGLE_API_KEY
+    http_timeout_seconds: 900
+    master_prompt: src/Gemini/prompts/master_prompt_gemini_en.md
+    # standard | flex | priority. Flex bills at the Batch rate with relaxed
+    # latency; priority at ~1.8x Standard.
+    service_tier: standard
+
+    generation:
+      # 64K ceiling, and it INCLUDES thinking tokens. Kept at the maximum:
+      # an `incomplete` interaction with no visible text means thinking ate
+      # the whole budget (see continuation.retry_lower_thinking_on_empty).
+      max_output_tokens: 65536
+      # temperature / top_p / top_k are intentionally absent. Google
+      # recommends defaults on Gemini 3; lowering temperature can cause
+      # looping. The client never sends them.
+
+    thinking:
+      # low | medium | high on 3.8 Flash, 3.1 Pro and gemini-4-argon
+      # ("minimal" is a 400 on 3.8 Flash and unlisted for Argon); 3.6 Flash
+      # also accepts minimal. Argon's API default is medium. Validated at startup.
+      # 3.8 Flash defaults to medium on the API; high is the literary default
+      # here, pending a sweep on this route's own chapters.
+      level: high
+      # auto returns thought summaries (THINKING/*.md); none suppresses them.
+      summaries: auto
+
+    streaming:
+      # Streams for connection liveness, then reads the stored interaction
+      # back with interactions.get() -- lossless, unlike reassembled deltas.
+      enabled: true
+
+    # ── Conversation (server-side chain + local ledger) ─────────────────────
+    conversation:
+      enabled: true
+      persistence_file: .context/gemini_conversation.json
+      # Chapters kept verbatim when the ledger is compacted (and replayed in a
+      # rebase / in batch contents).
+      recent_verbatim_chapters: 3
+      context_window: 1000000
+      soft_notice_ratio: 0.50
+      compact_ratio: 0.70
+      # Hard ceiling on chained input tokens; 0 = none. Defaults to 180000 on
+      # gemini-3.1-pro-preview, under the 200k tier that doubles input price.
+      # max_chain_input_tokens: 0
+      summary_head_chars: 240
+      summary_tail_chars: 480
+      previous_chapter_tail_chars: 1200
+
+    # ── Long Context + Long Decode (gemini-4-argon ONLY) ────────────────────
+    # Inert on every other model regardless of these switches.
+    long_context:
+      enabled: true
+      # One window SHARED by input, thinking and output. The ledger compacts
+      # against (context_window - output reservation), and the reservation
+      # is the active output ceiling -- long_decode.max_output_tokens when
+      # long decode is on. Overrides conversation.context_window on Argon.
+      context_window: 1048576
+    long_decode:
+      enabled: true
+      # Must exceed 65536 or long decode stays off. Sent with background=true
+      # (foreground requests above 64K are a 400) and clamped per request to
+      # the window minus the estimated input. Not "the rest of the window":
+      # the model ignores length targets and every token bills as output.
+      max_output_tokens: 262144
+      poll_seconds: 10
+      max_wait_hours: 24             # background interactions run up to 24h
+      max_consecutive_poll_failures: 10
+
+    # ── Explicit context caching (batch path only) ──────────────────────────
+    # Interactions has no explicit caching; the sync path uses implicit
+    # caching through the chain. Batch waves put their shared prefix (system
+    # instruction + replayed chapters) in one CachedContent when the estimated
+    # saving beats the hourly storage cost by break_even_margin.
+    # gemini-4-argon: this whole block is inert -- explicit caching is not
+    # supported. Argon rides implicit caching on shared prefixes of 6,144+
+    # tokens (durable caching on by default per Google's Gemini Enterprise
+    # Argon guide; no switch exists on either API), so static content
+    # stays at the start of the prompt: master policy, then volume context.
+    caching:
+      enabled: true
+      mode: auto                     # auto | always | never
+      min_tokens: 4096               # explicit-cache create minimum (not Argon's 6,144 implicit floor)
+      ttl_seconds: 3600              # extended while the job runs; deleted on landing
+      expected_wave_hours: 1.0
+      break_even_margin: 1.5
+      persistence_file: .context/gemini_cache_state.json
+      cache_monitor:
+        enabled: true
+        warn_threshold_cache_hit_ratio: 0.60
+        warn_threshold_prefix_recovery: 0.80
+
+    # ── Batch API (generateContent) ─────────────────────────────────────────
+    batch:
+      enabled: false
+      wave_size: 4                   # 1 = full sequential continuity at batch prices
+      seed_chapters: 1
+      seed_via_batch: true
+      poll_seconds: 60
+      completion_window: 48h         # JOB_STATE_EXPIRED fires at 48h
+      inline_limit_bytes: 16777216   # larger waves go through an uploaded JSONL file
+      persistence_file: .context/gemini_batch_state.json
+      # Batch-only: Interactions exposes no safety_settings, generateContent
+      # does. Leave empty for API defaults.
+      # safety_settings:
+      #   - {category: HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: BLOCK_ONLY_HIGH}
+      safety_settings: []
+
+    telemetry:
+      enabled: true
+      cache_quality: true
+
+    fidelity_gate:
+      enabled: true
+      block_on: [structural]         # missing | drifted | structural
+      ratio_tolerance: 0.35
+
+    continuation:
+      enabled: true
+      max_continuations: 3
+      retry_lower_thinking_on_empty: true
+
+    retry:
+      max_retries: 5
+      base_delay_ms: 1000
+      max_delay_ms: 60000
+      jitter_factor: 0.25
+      max_429_retries: 4             # RESOURCE_EXHAUSTED
+      max_503_retries: 4             # UNAVAILABLE (overloaded)
+
+    optimizations:
+      eps_guidance: true
+      voice_block: true
+
+  # ════════════════════════════════════════════════════════════════════════
+  # SAFETY-REFUSAL FALLBACK (Qwen → DeepSeek)
+  # ════════════════════════════════════════════════════════════════════════
+  # When Qwen's content moderation refuses a chapter (QwenModerationError,
+  # HTTP 400 family — e.g. code="InvalidParameter" + "inappropriate
+  # content"), the refusal is deterministic: retrying the same payload
+  # against the same gate fails identically. The client therefore does NOT
+  # retry. Instead it hands the chapter to the DeepSeek route — but not
+  # cold. Before the DeepSeek payload is built, an inheritance agent (one
+  # DeepSeek call running on the PREP config — model/endpoint/key below)
+  # reads every EN chapter Qwen has already produced, summarizes the
+  # translation decisions Qwen established (names, honorifics, voice,
+  # terminology, style), and injects that summary into a
+  # <translation_inheritance> block in context.xml with a marker, so the
+  # DeepSeek run inherits all of Qwen's decisions instead of reinventing
+  # them. The block is seeded <pending/> by the Librarian and left pending
+  # by prep; it is populated only at runtime when a safety refusal fires.
+  safety_fallback:
+    # Default ON for every non-DeepSeek Phase 2 provider — Qwen, Anthropic,
+    # OpenAI, and any future provider added to this route. Not a per-provider
+    # opt-in: src/Deepseek/common/safety_fallback.py is the one shared
+    # mechanism every provider's translate_chapter is expected to call on a
+    # content-safety refusal, the same way every provider must match
+    # translate_volume's call signature — see that module's docstring for
+    # the contract new providers are expected to satisfy.
+    enabled: true
+    fallback_provider: deepseek            # the only fallback target — DeepSeek is the one
+                                            # route with no content-moderation gate of its own
+    block_name: translation_inheritance    # context.xml block injected on refusal
+    # No static marker here on purpose: leaving this unset lets the code
+    # build "This run succeeds from <Provider>'s safety refusal..." with the
+    # actual source provider's name. Setting a marker string here overrides
+    # that for every provider verbatim — only do so deliberately.
+    # The inheritance agent runs on the PREP config (model/endpoint/api_key)
+    # — same credentials and endpoint prep uses, one-shot summarization call.
+    inherit_agent:
+      enabled: true
+      prompt: src/Qwen/prompts/inherit_decisions_prompt.xml
+
+# ── EPUB Builder ────────────────────────────────────────────────────────────
+builder:
+  # Font embedding for CJK glyph coverage in the output EPUB.
+  # Paths relative to LLM Translator/ root.
+  fonts:
+    enabled: true
+    # Add font paths here if you have custom CJK fonts
+    # japanese: fonts/NotoSansJP-Regular.otf
+    # english: fonts/NotoSerif-Regular.otf
+
+  # Target device for the build. Overridable per run with --profile.
+  #   passthrough  images copied untouched; reproduces pre-profile output
+  #   standard     300 PPI readers (Kindle, Kobo, tablets)
+  #   xteink-x3    XTEINK X3, 528x792 1-bit e-ink, CrossPoint firmware
+  #   xteink-x4    XTEINK X4, 480x800 1-bit e-ink, CrossPoint firmware
+  # The xteink profiles convert art to 8-bit grayscale, fit it to the panel,
+  # force baseline JPEG (progressive does not decode on those devices) and
+  # swap in a stylesheet limited to the nine CSS properties the firmware
+  # actually implements. See src/builder/device_profiles.py.
+  device_profile: standard
+
+  # Image optimization for cover/kuchie/illustrations.
+  # Consumed by the 'standard' profile; the xteink profiles carry their own
+  # panel-derived values and ignore these.
+  images:
+    max_width_px: 1200
+    max_height_px: 1800
+    jpeg_quality: 85
+
+  # Optional XTC/XTCH export — the CrossPoint firmware's native format, which
+  # stores PRE-RENDERED bitmap pages rather than text. Opt-in and off by
+  # default, because the trade is real: a ~400-page volume goes from ~1-2 MB to
+  # ~19 MB (xtc) or ~38 MB (xtch), and the reader permanently loses the ability
+  # to change font, size or margins. What it buys is the elimination of the
+  # 5-10s first-chapter parse, which the device already caches after one open.
+  #
+  # Rendering is delegated to https://github.com/bigbag/epub-to-xtc-converter
+  # (Node 18+, CREngine WASM). Clone it, run `npm install` in its cli/ dir, and
+  # point converter_path at the checkout. Do not vendor it into this repo.
+  xtc:
+    enabled: false
+    # Cloned outside this repo per the "do not vendor" note above.
+    converter_path: "D:/epub-to-xtc-converter"
+    node_bin: ""              # blank = find 'node' on PATH
+    format: xtc               # xtc (1-bit) | xtch (2-bit grayscale, ~2x size)
+    # XTEINK-spec'd Bookerly (serif, matches the Kindle reading face). The
+    # converter's own registerFont() call only ever loads ONE face per run
+    # (converter.js: a single registerFontFromMemory() call, no bold/italic
+    # slot anywhere in cli/settings.js's schema) — CREngine synthesizes
+    # bold/italic algorithmically from this Regular face rather than using
+    # true hinted variants. Bookerly-Bold/-Italic/-BoldItalic.ttf sit beside
+    # this file in the converter's fonts/ dir for if that ever gets patched
+    # to support multiple registered faces; they are not consumed today.
+    # The device's original Bookerly XTEINK_*.cpfont files (dev/Bookerly/)
+    # are a different, CrossPoint-firmware-native bitmap format ("CPFONT"
+    # magic header) for the device's own on-firmware renderer — CREngine's
+    # FreeType-based rasterizer cannot load them; only real TTF/OTF works.
+    font_path: "D:/epub-to-xtc-converter/fonts/Bookerly-Regular.ttf"
+    timeout_seconds: 1800
+    # Passed through to the converter's settings.json verbatim (deep-merged
+    # over the defaults its own `init` generates). The schema belongs to that
+    # tool, not to us, so anything not listed above goes here.
+    settings: {}
+
+# ── Logging ─────────────────────────────────────────────────────────────────
+logging:
+  level: INFO                           # DEBUG | INFO | WARNING | ERROR
+  file: logs/llm_translator.log
+  # Log API cost per chapter (input/output/cache tokens → USD)
+  cost_tracking: true
+
+# ── MCP Harness ─────────────────────────────────────────────────────────────
+# The harness is loaded by src/mcp/harness.py and injected as the system
+# identity prefix before every LLM call the MCP server makes (prep, translate).
+mcp_harness:
+  persona:
+    # Central persona file — full port of CLAUDE.md for LLM API consumption.
+    # Loaded at MCP server startup, cached in memory, prepended to every
+    # system instruction built by harness.build_system_instruction().
+    file: .github/PERSONA.md
+    enabled: true              # ← the only knob the user touches
+
+  subagents:
+    prep:
+      enabled: true
+      model: deepseek-v4-flash
+      thinking_budget: 64000
+      effort: xhigh
+      max_output_tokens: 128000
+
+    translator:
+      harness_managed: true   # DeepSeekClient owns its config (translation.deepseek)
+
+    qc:
+      enabled: true            # Agent-managed; evaluator model comes from the host
+
+    bible_writer:
+      enabled: true            # Filesystem-only, no LLM call
+
+# ── QC Gate Configuration ───────────────────────────────────────────────────
+# Translation-evaluator skill uses the active Codex or Claude host model.
+# This block only locates optional calibration material; it never routes
+# evaluator calls to a translation provider.
+qc:
+  golden_samples:
+    registry_dir: .agents/skills/translation-evaluator/references/golden-samples/

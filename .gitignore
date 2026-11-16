@@ -1,0 +1,93 @@
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+*.env.local
+*.env.*.local
+
+# ── Development Files ─────────────────────────────────────────────────────
+dev/
+_design/
+_docs/
+*.tmp.md
+# tests/ is tracked: the offline suite (pytest) is part of the project.
+docs/
+dsh/
+
+# ── Agent/Skill Authoring (local by default) ────────────────────────────────
+# Explicitly tracked translation-evaluator instructions and thin adapters are
+# the exception. Vendored API docs, QC calibration excerpts, and full-text
+# commercial ebook extracts remain local and must not be staged.
+.agents/
+.codex/
+.grok/
+.dsh/
+.
+
+# ── Foreign nested repositories (never vendor another project's history) ───
+epub-to-xtc-converter/
+
+# ── Claude Local Settings ───────────────────────────────────────────────────
+.claude/
+CLAUDE.local.md
+.claude.json
+CLAUDE.md
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+venv/
+.venv/
+env/
+.python-version
+*.log
+
+# ── Node / TypeScript ───────────────────────────────────────────────────────
+node_modules/
+*.tsbuildinfo
+dist-ts/
+
+# ── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/settings.json
+.vscode/*.code-workspace
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Workspace Artifacts (don't commit actual translation data) ──────────────
+raw/*
+!raw/.gitkeep
+output/*
+!output/.gitkeep
+work/*
+!work/.gitkeep
+logs/*
+!logs/.gitkeep
+cache/*
+!cache/.gitkeep
+
+# ── MCP Server State ────────────────────────────────────────────────────────
+.mcp_state/
+
+# ── Copyrighted Workspaces ────────────────────────────────────────────────────────
+raw/
+work/
+
+# ── IDE-Workspace / Agent Authoring (local by default) ─────────────────────
+# Only src/ (the actual DeepSeek MTLS source) and src/prompt/ (the shipped
+# translation prompts) go to the remote. Everything that configures how an
+# AI agent develops or operates this repo stays local: subagent/skill
+# definitions, the orchestrator persona, and dev planning notes. The tracked
+# evaluator entrypoint and mtl-qc adapter are narrow exceptions.
+.github/
+/AGENTS.md
+/PLANNING.md
+bible/
+bibles/

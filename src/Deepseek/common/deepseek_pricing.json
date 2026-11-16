@@ -1,0 +1,19 @@
+{
+  "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "unit": "USD per 1M tokens",
+  "peak_utc_windows": [],
+  "model_display_names": {
+    "deepseek-v4-flash": "DeepSeek-V4-Flash-0731",
+    "deepseek-v4-pro": "DeepSeek-V4-Pro-0813"
+  },
+  "models": {
+    "deepseek-v4-flash": {
+      "off_peak": {"cache_hit": 0.0028, "cache_miss": 0.14, "output": 0.28},
+      "peak": {"cache_hit": 0.0028, "cache_miss": 0.14, "output": 0.28}
+    },
+    "deepseek-v4-pro": {
+      "off_peak": {"cache_hit": 0.003625, "cache_miss": 0.435, "output": 0.87},
+      "peak": {"cache_hit": 0.003625, "cache_miss": 0.435, "output": 0.87}
+    }
+  }
+}
