@@ -760,6 +760,17 @@ validation (no Japanese script, one paragraph, sane length, same illustration
 tags). The chapter is backed up to `.context/repair_backups/` and each change
 is logged in `QC/repair_log.json`.
 
+### Vietnamese EPUB fonts
+
+Vietnamese books embed their fonts, so diacritics render the same on every
+reader: **Literata** for the text (a serif designed for long reading on
+screens) and **Inter** for chapter titles. Both are SIL OFL fonts with the
+full Vietnamese alphabet, subset to Latin + Vietnamese (adds about 0.5 MB
+to each EPUB). Files and licenses are in `fonts/`; change or turn
+off embedding in `project.languages.vi.epub_fonts` (`embed: false` keeps only
+the CSS font names). On Kindle, choose *Publisher Font* to see them. English
+books are unchanged.
+
 ### Web novel import (Syosetu / Kakuyomu)
 
 ```powershell

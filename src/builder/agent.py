@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
 import xml.etree.ElementTree as ET
 
-from src.Deepseek.common.config import WORK_DIR, OUTPUT_DIR, OS_PATHS, get_target_language, get_language_config
+from src.Deepseek.common.config import WORK_DIR, OUTPUT_DIR, OS_PATHS, get_target_language, get_language_config, PIPELINE_ROOT
 from .epub_structure import create_epub_structure, EPUBPaths
 from .opf_generator import OPFGenerator, BookMetadata, ManifestItem, SpineItem
 from .ncx_generator import NCXGenerator, NavPoint
@@ -34,7 +34,7 @@ from .device_profiles import (
     resolve_profile,
 )
 from .image_optimizer import EmitResult, optimize_image_to, summarize as summarize_images
-from .stylesheets import EINK_CSS, LANGUAGE_CSS, mark_dialogue_paragraphs
+from .stylesheets import EINK_CSS, LANGUAGE_CSS, language_font_assets, mark_dialogue_paragraphs
 from .config import get_xtc_config
 from .xtc_export import VALID_FORMATS as XTC_FORMATS, export_xtc
 from . import device_budgets
@@ -2859,13 +2859,25 @@ class BuilderAgent:
             # Language additions only on the full-CSS profile; the e-ink
             # stylesheet is limited to the nine properties its firmware has.
             css = css + LANGUAGE_CSS.get(str(target_language or "en").lower(), "")
+            font_css, font_files = language_font_assets(target_language, PIPELINE_ROOT)
+            css = css + font_css
+        else:
+            font_files = []
         css_path.write_text(css, encoding='utf-8')
 
-        return [ManifestItem(
+        items = [ManifestItem(
             id="css",
             href="Styles/stylesheet.css",
             media_type="text/css"
         )]
+        for src, href, item_id in font_files:
+            target = css_path.parent.parent / href
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, target)
+            items.append(ManifestItem(id=item_id, href=href, media_type="font/ttf"))
+        if font_files:
+            print(f"     Embedded fonts: {', '.join(Path(h).name for _, h, _ in font_files)}")
+        return items
 
     def _generate_opf(
         self,

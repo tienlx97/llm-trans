@@ -21,6 +21,26 @@ project:
       language_name: Vietnamese
       language_code: vi            # dc:language / xml:lang in the built EPUB
       output_suffix: _VI           # output/<title>_VI.epub
+      # Fonts embedded in Vietnamese EPUBs (SIL OFL 1.1, subset to Latin +
+      # Vietnamese + punctuation; see fonts/README.md). body = the reading
+      # text, heading = chapter titles. A face left out is not embedded; with
+      # embed: false the CSS only names the families (reader fonts are used).
+      epub_fonts:
+        embed: true
+        body:
+          family: Literata
+          fallback: '"Noto Serif", "Bookerly", "Charis SIL", Georgia, "Times New Roman", serif'
+          files:
+            regular: fonts/literata/Literata-Regular.ttf
+            bold: fonts/literata/Literata-Bold.ttf
+            italic: fonts/literata/Literata-Italic.ttf
+            bold_italic: fonts/literata/Literata-BoldItalic.ttf
+        heading:
+          family: Inter
+          fallback: '"Be Vietnam Pro", "Noto Sans", "Segoe UI", Arial, sans-serif'
+          files:
+            regular: fonts/inter/Inter-Regular.ttf
+            bold: fonts/inter/Inter-Bold.ttf
       providers:
         openai:
           master_prompt: src/prompts/vi/master_prompt_light_novel_vi.md

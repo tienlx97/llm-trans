@@ -42,6 +42,8 @@ cheapest rule is the one we never ship.
 """
 
 import re
+from pathlib import Path
+from typing import List
 
 EINK_CSS = '''/* CrossPoint / XTEINK stylesheet - nine supported properties only */
 @charset "UTF-8";
@@ -249,3 +251,69 @@ def mark_dialogue_paragraphs(xhtml: str) -> str:
     """Give dialogue paragraphs (opening quote or dialogue dash) a class so
     the stylesheet can treat them distinctly from narration."""
     return _DIALOGUE_P_RE.sub('<p class="dialogue">', xhtml)
+
+
+# ── Embedded fonts (per target language) ────────────────────────────────────
+# project.languages.<lang>.epub_fonts in config.yaml names a body (reading)
+# font and a heading font, each with up to four faces. The files are copied
+# into OEBPS/Fonts/ and declared with @font-face, so the book looks the same
+# on readers that do not ship the font (Kindle shows them with "Publisher
+# Font" on). A missing file is skipped with a warning; the CSS still names the
+# family first, so a reader that has it installed uses it.
+
+_FACE_STYLES = {
+    "regular": ("normal", "normal"),
+    "bold": ("bold", "normal"),
+    "italic": ("normal", "italic"),
+    "bold_italic": ("bold", "italic"),
+}
+
+_ROLE_SELECTORS = {
+    "body": ":root:lang(vi), body:lang(vi)",
+    "heading": ":lang(vi) h1, :lang(vi) h2, :lang(vi) h3, :lang(vi) h4",
+}
+
+
+def language_font_assets(lang: str, project_root: Path):
+    """``(css, files)`` for the target language's embedded fonts, where
+    ``files`` is ``[(source_path, href_inside_OEBPS, item_id)]``.
+    ``("", [])`` when the language configures no fonts."""
+    from src.Deepseek.common.language import language_config
+
+    lang = str(lang or "en").lower()
+    cfg = (language_config(lang) or {}).get("epub_fonts") if lang != "en" else None
+    if not cfg:
+        return "", []
+    embed = bool(cfg.get("embed", True))
+    selector_lang = f":lang({lang})"
+    faces_css: List[str] = []
+    rules: List[str] = []
+    files = []
+    for role in ("body", "heading"):
+        spec = cfg.get(role) or {}
+        family = str(spec.get("family") or "").strip()
+        if not family:
+            continue
+        for face, rel in (spec.get("files") or {}).items() if embed else ():
+            if face not in _FACE_STYLES or not rel:
+                continue
+            src = (project_root / str(rel)).resolve()
+            if not src.is_file():
+                print(f"     [WARNING] font file not found, not embedded: {src}")
+                continue
+            weight, style = _FACE_STYLES[face]
+            href = f"Fonts/{src.name}"
+            item_id = "font-" + re.sub(r"[^a-z0-9]+", "-", src.stem.lower()).strip("-")
+            if all(h != href for _, h, _ in files):
+                files.append((src, href, item_id))
+            faces_css.append(
+                f'@font-face {{\n  font-family: "{family}";\n  src: url("../{href}") format("truetype");\n'
+                f"  font-weight: {weight};\n  font-style: {style};\n}}"
+            )
+        fallback = str(spec.get("fallback") or "serif").strip()
+        selector = _ROLE_SELECTORS[role].replace(":lang(vi)", selector_lang)
+        rules.append(f'{selector} {{\n  font-family: "{family}", {fallback};\n}}')
+    if not rules:
+        return "", []
+    css = "\n\n/* Embedded fonts */\n" + "\n".join(faces_css + rules) + "\n"
+    return css, files

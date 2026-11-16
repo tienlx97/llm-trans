@@ -266,3 +266,17 @@ def test_builder_uses_the_site_as_publisher_for_web_novels(tmp_path):
     assert "syosetu" in _web_import_publisher(tmp_path)
     (tmp_path / "manifest.json").write_text(json.dumps({}), encoding="utf-8")
     assert _web_import_publisher(tmp_path) == ""
+
+
+def test_vietnamese_stylesheet_embeds_the_configured_fonts():
+    from src.Deepseek.common.config import PIPELINE_ROOT
+    from src.builder.stylesheets import language_font_assets
+
+    css, files = language_font_assets("vi", PIPELINE_ROOT)
+    hrefs = [href for _, href, _ in files]
+    assert "Fonts/Literata-Regular.ttf" in hrefs and "Fonts/Inter-Bold.ttf" in hrefs
+    assert all(src.is_file() for src, _, _ in files)
+    assert '@font-face' in css and 'url("../Fonts/Literata-Regular.ttf")' in css
+    assert 'body:lang(vi) {\n  font-family: "Literata"' in css
+    assert ':lang(vi) h1' in css and '"Inter"' in css
+    assert language_font_assets("en", PIPELINE_ROOT) == ("", [])
