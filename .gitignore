@@ -3,46 +3,35 @@
 *.env.local
 *.env.*.local
 
-# ── Development Files ─────────────────────────────────────────────────────
-dev/
-_design/
-_docs/
-*.tmp.md
-# tests/ is tracked: the offline suite (pytest) is part of the project.
-docs/
-dsh/
+# ── Copyrighted / generated workspaces (never commit translation data) ─────
+raw/
+work/
+output/*
+!output/.gitkeep
+logs/*
+!logs/.gitkeep
+cache/*
+!cache/.gitkeep
+.mcp_state/
 
-# ── Agent/Skill Authoring (local by default) ────────────────────────────────
-# Explicitly tracked translation-evaluator instructions and thin adapters are
-# the exception. Vendored API docs, QC calibration excerpts, and full-text
-# commercial ebook extracts remain local and must not be staged.
-.agents/
-.codex/*
-!.codex/config.toml
-.grok/
-.dsh/
-
-# ── Foreign nested repositories (never vendor another project's history) ───
-epub-to-xtc-converter/
-
-# ── Claude Local Settings ───────────────────────────────────────────────────
+# ── Local agent state (AGENTS.md, CLAUDE.md, harness/ and .codex/config.toml
+#    are shipped; per-user settings and run output are not) ─────────────────
 .claude/
 CLAUDE.local.md
 .claude.json
+.codex/*
+!.codex/config.toml
+.harness/
 
 # ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
-*.pyo
 *.egg-info/
 dist/
 build/
-*.egg
-.eggs/
-venv/
 .venv/
-env/
-.python-version
+venv/
+.pytest_cache/
 *.log
 
 # ── Node / TypeScript ───────────────────────────────────────────────────────
@@ -50,47 +39,9 @@ node_modules/
 *.tsbuildinfo
 dist-ts/
 
-# ── IDE ─────────────────────────────────────────────────────────────────────
+# ── IDE / OS ────────────────────────────────────────────────────────────────
 .vscode/settings.json
 .vscode/*.code-workspace
 .idea/
-*.swp
-*.swo
-*~
 .DS_Store
 Thumbs.db
-
-# ── Workspace Artifacts (don't commit actual translation data) ──────────────
-output/*
-!output/.gitkeep
-logs/*
-!logs/.gitkeep
-cache/*
-!cache/.gitkeep
-
-# ── MCP Server State ────────────────────────────────────────────────────────
-.mcp_state/
-
-# ── Copyrighted Workspaces ────────────────────────────────────────────────────────
-raw/
-work/
-
-# ── IDE-Workspace / Agent Authoring (local by default) ─────────────────────
-# Only src/ (the actual DeepSeek MTLS source) and src/prompt/ (the shipped
-# translation prompts) go to the remote. Everything that configures how an
-# AI agent develops or operates this repo stays local: subagent/skill
-# definitions, the orchestrator persona, and dev planning notes. The tracked
-# evaluator entrypoint and mtl-qc adapter are narrow exceptions.
-.github/
-/PLANNING.md
-# Root-anchored on purpose: an unanchored `bible/` also swallowed the source
-# package src/utility/bible/, which is why it never reached the remote.
-/bible/
-/bibles/
-<<<<<<< HEAD
-=======
-
-# Shipped coding-agent harness (AGENTS.md, CLAUDE.md, harness/, src/harness/);
-# only per-run state stays local.
-.harness/
->>>>>>> 236200f (Add coding-agent harness, incremental VI translation, translate-chap script)
