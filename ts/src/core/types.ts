@@ -33,30 +33,13 @@ export type VolumeSummary = {
   manifestError?: string;
 };
 
-export type ChapterLog = {
-  chapterId: ChapterRef;
-  inputTokens: number;
-  outputTokens: number;
-  success: boolean;
-  error: string | null;
-  passed: boolean | null;
-  aiIsmCount: number | null;
-};
-
 export type VolumeDetail = {
   id: VolumeId;
-  loaded: boolean;
   jpChapters: number;
-  enChapters: number;
-  enWords: number;
+  translatedChapters: number;
+  // EN, VI, ... — the workspace's own translation folder.
+  translatedDir: string;
   qcReports: number;
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  successCount: number;
-  failCount: number;
-  aiIsmTotal: number;
-  lastError: string | null;
-  logChapters: ChapterLog[];
 };
 
 export type ConfigLine =

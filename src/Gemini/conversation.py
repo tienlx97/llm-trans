@@ -34,7 +34,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from src.Deepseek.common.config import cfg_int
 from src.Deepseek.common.atomic_io import atomic_write_json
+from src.Deepseek.common.token_estimate import estimate_tokens
 from src.Gemini.prompt_loader import build_rebase_preamble
 
 logger = logging.getLogger(__name__)
@@ -79,8 +81,8 @@ class GeminiConversationManager:
         default_ceiling = 180_000 if self.model.startswith("gemini-3.1-pro") else 0
         raw_ceiling = config.get("max_chain_input_tokens", default_ceiling)
         self.max_chain_input_tokens = max(0, int(default_ceiling if raw_ceiling is None else raw_ceiling))
-        self.summary_head_chars = max(0, int(config.get("summary_head_chars", 240) or 240))
-        self.summary_tail_chars = max(0, int(config.get("summary_tail_chars", 480) or 480))
+        self.summary_head_chars = max(0, cfg_int(config, "summary_head_chars", 240))
+        self.summary_tail_chars = max(0, cfg_int(config, "summary_tail_chars", 480))
         raw_path = Path(str(config.get("persistence_file", ".context/gemini_conversation.json")))
         self.state_path = raw_path if raw_path.is_absolute() else self.work_dir / raw_path
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -289,14 +291,15 @@ class GeminiConversationManager:
     def estimated_tokens(self) -> int:
         """Context pressure in tokens: the server's own count for the chain
         head when there is one, else a character estimate of what a rebase
-        would send. Japanese source runs denser than 4 chars/token, so the
-        estimate counts the user envelopes at 2 chars/token."""
+        would send, through the shared CJK-aware estimate (Japanese runs about
+        1.1-1.4 chars/token; see token_estimate)."""
         observed = int(self.state.get("chain_input_tokens") or 0)
         if observed and self.chain_head:
             return observed
-        english = sum(len(str(turn.get("model_text") or "")) for turn in self.turns)
-        envelopes = sum(len(str(turn.get("user_text") or "")) for turn in self.turns)
-        return max(1, english // 4 + envelopes // 2 + len(str(self.state.get("summary") or "")) // 4)
+        return max(1, sum(
+            estimate_tokens(str(turn.get("model_text") or "")) + estimate_tokens(str(turn.get("user_text") or ""))
+            for turn in self.turns
+        ) + estimate_tokens(str(self.state.get("summary") or "")))
 
     def _maybe_compact(self) -> None:
         if len(self.turns) <= self.recent_verbatim_chapters:

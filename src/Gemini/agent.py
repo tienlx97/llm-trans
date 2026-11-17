@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from src.Deepseek.common.chapter_order import in_reading_order, preceding_chapter_id
+from src.Deepseek.common.config import cfg_int
 from src.Deepseek.common.atomic_io import atomic_write_json, atomic_write_text
 from src.Deepseek.common.chapter_signals import build_chapter_signal_guidance, parse_chapter_signals
 from src.Deepseek.common.config import PIPELINE_ROOT, WORK_DIR, get_safety_fallback_config
@@ -86,6 +88,18 @@ from src.Gemini.prompt_loader import (
 from src.Gemini.response import thinking_tally
 
 logger = logging.getLogger(__name__)
+
+
+def _block_on_setting(cfg: Dict[str, Any]) -> List[str]:
+    """fidelity_gate.block_on, defaulting only when the key is absent or null.
+
+    An explicit ``[]`` means "record findings, never block" (config.yaml);
+    ``cfg.get("block_on") or [...]`` turned it into "block on everything".
+    """
+    value = cfg.get("block_on")
+    if value is None:
+        return ["missing", "drifted", "structural"]
+    return list(value) if isinstance(value, (list, tuple, set)) else [value]
 # Japanese script only. The rest of U+FF00-FFEF is left alone: a
 # translation_policy can require a fullwidth glyph verbatim (see the Anthropic
 # route's note on volume 3e35fe's ＊).
@@ -152,10 +166,10 @@ class GeminiTranslator:
             self.client.conversation_manager.bind_system(self.system_segments)
             self.client.conversation_manager.language_name = language_name(self.target_language)
         self._previous_guidance_text: Optional[str] = None
-        self._previous_tail_chars = max(0, int(conversation_cfg.get("previous_chapter_tail_chars", 1200) or 1200))
+        self._previous_tail_chars = max(0, cfg_int(conversation_cfg, "previous_chapter_tail_chars", 1200))
         continuation = get_gemini_continuation_config()
         self.continuation_enabled = bool(continuation.get("enabled", True))
-        self.max_continuations = max(0, int(continuation.get("max_continuations", 3) or 3))
+        self.max_continuations = max(0, cfg_int(continuation, "max_continuations", 3))
         # An `incomplete` interaction with NO visible text means thinking used
         # the whole 64K budget; a continuation cannot rescue that. Retry the
         # chapter once at the next lower thinking level instead.
@@ -201,12 +215,7 @@ class GeminiTranslator:
         return rows
 
     def _preceding_chapter_id(self, chapter_id: str) -> Optional[str]:
-        match = _CHAPTER_INDEX_RE.match(str(chapter_id))
-        if match is None:
-            return None
-        prefix, digits = match.group(1), match.group(2)
-        index = int(digits)
-        return None if index <= 1 else "%s%0*d" % (prefix, len(digits), index - 1)
+        return preceding_chapter_id(chapter_id)
 
     def _chapter_tail_from_disk(self, chapter_id: str) -> str:
         if self._previous_tail_chars <= 0:
@@ -594,7 +603,7 @@ class GeminiTranslator:
         route, written to .context/anchor_reconciliation.json."""
         cfg = get_gemini_fidelity_config()
         gate_enabled = bool(cfg.get("enabled", True))
-        block_on = {str(item).strip().lower() for item in (cfg.get("block_on") or ["missing", "drifted", "structural"])}
+        block_on = {str(item).strip().lower() for item in _block_on_setting(cfg)}
         try:
             tolerance = float(cfg.get("ratio_tolerance", DEFAULT_RATIO_TOLERANCE) or DEFAULT_RATIO_TOLERANCE)
         except (TypeError, ValueError):
@@ -699,7 +708,7 @@ class GeminiTranslator:
         output_path = self._output_path(chapter_id)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         text = self._reinject_illustrations(chapter_id, text)
-        output_path.write_text(text, encoding="utf-8")
+        atomic_write_text(output_path, text)
         blocking = self._check_chapter_fidelity(chapter_id, text)
         truncated, self._last_truncated = self._last_truncated, False
         if truncated and not self._is_english:
@@ -725,7 +734,7 @@ class GeminiTranslator:
     def translate_all(self, chapter_files: List[Path]) -> Dict[str, Path]:
         return {
             path.stem: self.translate_and_persist_chapter(path, {"chapter_id": path.stem})
-            for path in sorted(chapter_files)
+            for path in in_reading_order(chapter_files)
         }
 
     # ── batch path ─────────────────────────────────────────────────────────
@@ -748,7 +757,7 @@ class GeminiTranslator:
         from src.Gemini.caching import GeminiContextCache
 
         batch_cfg = get_gemini_batch_config()
-        pending = sorted(chapter_files)
+        pending = in_reading_order(chapter_files)
         if not pending:
             return {}
         manager = self.client.conversation_manager
@@ -1089,7 +1098,7 @@ def reconcile_manifest_from_disk(work_dir: Path) -> Dict[str, str]:
     is_english = volume_target_language(Path(work_dir)) == DEFAULT_LANGUAGE
     anchors = parse_anchors(context_xml) if is_english else []
     cfg = get_gemini_fidelity_config()
-    block_on = {str(item).strip().lower() for item in (cfg.get("block_on") or ["missing", "drifted", "structural"])}
+    block_on = {str(item).strip().lower() for item in _block_on_setting(cfg)}
     try:
         tolerance = float(cfg.get("ratio_tolerance", DEFAULT_RATIO_TOLERANCE) or DEFAULT_RATIO_TOLERANCE)
     except (TypeError, ValueError):
@@ -1190,7 +1199,7 @@ def translate_volume(
     jp_dir = work_dir / "JP"
     if not jp_dir.is_dir():
         raise FileNotFoundError(f"No JP/ directory for volume {volume_id!r} at {jp_dir}")
-    chapter_files = sorted(jp_dir.glob("CHAPTER_*.md"))
+    chapter_files = in_reading_order(jp_dir.glob("CHAPTER_*.md"))
     if chapters:
         wanted = set(chapters)
         chapter_files = [p for p in chapter_files if p.stem in wanted or p.stem.split("_")[-1] in wanted]

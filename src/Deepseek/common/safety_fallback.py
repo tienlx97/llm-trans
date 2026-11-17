@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 from src.Deepseek.common.atomic_io import atomic_write_json, atomic_write_text
+from src.Deepseek.common.chapter_order import reading_order
 from src.Deepseek.common.config import PIPELINE_ROOT, get_config_section
 from src.utility.prep.agent import _call_deepseek_prep
 
@@ -126,12 +127,6 @@ def _load_inherit_prompt() -> Tuple[str, str]:
     return (sys_el.text or "").strip(), (user_el.text or "").strip()
 
 
-def _chapter_sort_key(chapter_id: str) -> Tuple[int, str]:
-    """Natural sort key so CHAPTER_10 sorts after CHAPTER_09, not after 01."""
-    digits = "".join(ch for ch in chapter_id if ch.isdigit())
-    return (int(digits) if digits else 0, chapter_id)
-
-
 def _prior_completed_chapters(work_dir: Path, exclude_chapter_id: str) -> List[str]:
     """Sorted ids of EN chapters already on disk, excluding the refused one."""
     en_dir = Path(work_dir) / "EN"
@@ -142,7 +137,7 @@ def _prior_completed_chapters(work_dir: Path, exclude_chapter_id: str) -> List[s
         for path in en_dir.glob("CHAPTER_*_EN.md")
         if path.stem.replace("_EN", "") != exclude_chapter_id
     ]
-    return sorted(ids, key=_chapter_sort_key)
+    return sorted(ids, key=reading_order)
 
 
 def _collect_prior_translated_chapters(work_dir: Path, exclude_chapter_id: str) -> str:

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 from src.Deepseek.common.atomic_io import atomic_write_json, atomic_write_text
+from src.Deepseek.common.chapter_order import in_reading_order
 from src.Deepseek.common.config import WORK_DIR, get_config_section
 from src.utility.prep.block_prompts import MULTITURN_BLOCK_ORDER
 
@@ -127,7 +128,8 @@ def _read_jp_chapters(work_dir: Path) -> List[Tuple[str, str]]:
     if not jp_dir.is_dir():
         raise PrepError(f"No JP/ directory for this volume at {jp_dir} — run extract first.")
     chapters = []
-    for path in sorted(jp_dir.glob("*.md")):
+    # Story order: the model reads the volume in this order (see chapter_order).
+    for path in in_reading_order(jp_dir.glob("*.md")):
         chapters.append((path.stem, path.read_text(encoding="utf-8")))
     if not chapters:
         raise PrepError(f"JP/ directory at {jp_dir} has no chapter files.")
@@ -569,9 +571,17 @@ def _run_unified_prep(
     try:
         root = ET.fromstring(populated_xml)
     except ET.ParseError as exc:
+        # The call is already paid for: keep what came back (the message
+        # below used to promise this without doing it).
+        raw_path = work_dir / ".context" / "prep_raw_response.xml"
+        try:
+            atomic_write_text(raw_path, raw_response)
+            saved = f"Raw response saved to {raw_path}."
+        except OSError as save_exc:
+            saved = f"Raw response could not be saved ({save_exc})."
         raise PrepError(
             f"{label} returned malformed context.xml ({exc}) — refusing to overwrite "
-            f"the existing file. Raw response saved for inspection."
+            f"the existing file. {saved}"
         ) from exc
 
     if root.tag != "mtls_project_context":

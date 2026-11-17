@@ -8,7 +8,9 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+from src.Deepseek.common.config import cfg_int
 from src.Deepseek.common.atomic_io import atomic_write_json
+from src.Deepseek.common.token_estimate import estimate_tokens
 from src.OpenAI.response import normalize_openai_output
 
 logger = logging.getLogger(__name__)
@@ -36,8 +38,8 @@ class OpenAIConversationManager:
         self.hard_trim_ratio = float(config.get("hard_trim_ratio", 0.90) or 0.90)
         raw_ceiling_ratio = config.get("verbatim_ceiling_ratio", 0.60)
         self.verbatim_ceiling_ratio = 0.60 if raw_ceiling_ratio is None else float(raw_ceiling_ratio)
-        self.summary_head_chars = max(0, int(config.get("summary_head_chars", 240) or 240))
-        self.summary_tail_chars = max(0, int(config.get("summary_tail_chars", 480) or 480))
+        self.summary_head_chars = max(0, cfg_int(config, "summary_head_chars", 240))
+        self.summary_tail_chars = max(0, cfg_int(config, "summary_tail_chars", 480))
         raw_path = Path(str(config.get("persistence_file", ".context/openai_conversation.json")))
         self.state_path = raw_path if raw_path.is_absolute() else self.work_dir / raw_path
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +81,7 @@ class OpenAIConversationManager:
 
     def estimated_tokens(self, items: Any = None) -> int:
         serialized = json.dumps(self._all_replay_items() if items is None else items, ensure_ascii=False)
-        return max(1, len(serialized) // 4)
+        return estimate_tokens(serialized)
 
     def input_items(
         self,

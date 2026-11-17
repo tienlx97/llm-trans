@@ -9,8 +9,6 @@
     "typecheck": "tsc -b",
     "typecheck:watch": "tsc -b --watch",
     "clean": "tsc -b --clean",
-    "test": "tsx --tsconfig ./tsconfig.base.json tests/run.ts",
-    "test:smoke": "tsx --tsconfig ./tsconfig.base.json tests/mcp-smoke.ts",
     "knip": "knip --no-progress"
   },
   "dependencies": {

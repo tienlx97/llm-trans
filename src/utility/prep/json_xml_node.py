@@ -55,6 +55,11 @@ _TRAILING_COMMA_RE = re.compile(r",(\s*[}\]])")
 _XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
 
 _CONTROL_CHAR_REPAIR = "accepted unescaped control characters inside string values"
+# ElementTree accepts any string as a tag or attribute name and serializes it
+# verbatim, so a model-invented name such as "voice profile" or "1st" would
+# write a context.xml that no later phase can parse. Names are checked here,
+# where the turn can still be re-asked.
+_XML_NAME_RE = re.compile(r"^[A-Za-z_][\w.\-]*$")
 
 
 class JsonNodeError(ValueError):
@@ -180,6 +185,10 @@ def extract_json_node(raw_text: str, *, expected_tag: str | None = None) -> Dict
             f"expected block '{expected_tag}', got tag '{tag}' — response started with: "
             f"{stripped[:300]!r}"
         )
+    # Convert once now so a node that cannot become XML fails THIS turn, which
+    # the callers re-ask, instead of failing final assembly after every turn
+    # has been paid for.
+    node_to_element(data)
     return data
 
 
@@ -199,6 +208,8 @@ def node_to_element(node: Dict[str, Any]) -> ET.Element:
     tag = node.get("tag")
     if not isinstance(tag, str) or not tag:
         raise JsonNodeError(f"node is missing a non-empty string 'tag': {node!r}")
+    if not _XML_NAME_RE.match(tag):
+        raise JsonNodeError(f"'{tag}' is not a valid XML element name")
 
     raw_attrs = node.get("attrs") or {}
     if not isinstance(raw_attrs, dict):
@@ -207,6 +218,9 @@ def node_to_element(node: Dict[str, Any]) -> ET.Element:
         str(key): "" if value is None else _xml_safe(str(value))
         for key, value in raw_attrs.items()
     }
+    bad = [key for key in attrs if not _XML_NAME_RE.match(key)]
+    if bad:
+        raise JsonNodeError(f"<{tag}> has invalid XML attribute name(s): {bad}")
 
     element = ET.Element(tag, attrs)
 

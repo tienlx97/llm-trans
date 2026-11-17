@@ -23,7 +23,6 @@ from src.OpenAI.response import as_dict, response_to_llm_response
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUSES = {"expired", "cancelled", "canceled"}
 _PERMANENT_ERROR_TYPES = {"invalid_request", "invalid_request_error", "authentication_error", "permission_error"}
 _MAX_BATCH_REQUESTS = 50_000
 _MAX_BATCH_BYTES = 200 * 1024 * 1024
@@ -293,10 +292,6 @@ def batch_is_terminal(status: str) -> bool:
         "cancelled",
         "canceled",
     }
-
-
-def batch_status_retryable(status: str) -> bool:
-    return str(status or "").strip().lower() in _RETRYABLE_STATUSES
 
 
 def _classify_error(outcome: BatchOutcome, custom_id: str, status_code: int, payload: Dict[str, Any]) -> None:

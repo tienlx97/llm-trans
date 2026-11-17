@@ -61,6 +61,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+from src.Deepseek.common.config import cfg_float, cfg_int
 from src.Anthropic.config import get_anthropic_config
 from src.Anthropic.errors import RetryPolicy, call_with_retry, classify_exception
 from src.Anthropic.response import response_to_llm_response
@@ -476,12 +477,12 @@ class AnthropicClient:
 
         retry_cfg = cfg.get("retry", {}) or {}
         policy = RetryPolicy(
-            max_retries=int(retry_cfg.get("max_retries", 5) or 5),
+            max_retries=cfg_int(retry_cfg, "max_retries", 5),
             base_delay_ms=int(retry_cfg.get("base_delay_ms", 500) or 500),
             max_delay_ms=int(retry_cfg.get("max_delay_ms", 32_000) or 32_000),
-            jitter_factor=float(retry_cfg.get("jitter_factor", 0.25) or 0.25),
-            max_429_retries=int(retry_cfg.get("max_429_retries", 3) or 3),
-            max_529_retries=int(retry_cfg.get("max_529_retries", 3) or 3),
+            jitter_factor=cfg_float(retry_cfg, "jitter_factor", 0.25),
+            max_429_retries=cfg_int(retry_cfg, "max_429_retries", 3),
+            max_529_retries=cfg_int(retry_cfg, "max_529_retries", 3),
         )
 
         def invoke() -> LLMResponse:

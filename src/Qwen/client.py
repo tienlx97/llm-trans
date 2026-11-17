@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from src.Deepseek.common.config import cfg_float, cfg_int
 from src.Deepseek.common.llm_types import (
     LLMApiFamily,
     LLMResponse,
@@ -222,11 +223,11 @@ class QwenClient:
             )
 
         policy = RetryPolicy(
-            max_retries=int(retry_cfg.get("max_retries", 5) or 5),
+            max_retries=cfg_int(retry_cfg, "max_retries", 5),
             base_delay_ms=int(retry_cfg.get("base_delay_ms", 500) or 500),
             max_delay_ms=int(retry_cfg.get("max_delay_ms", 32000) or 32000),
-            jitter_factor=float(retry_cfg.get("jitter_factor", 0.25) or 0.25),
-            max_429_retries=int(retry_cfg.get("max_429_retries", 3) or 3),
+            jitter_factor=cfg_float(retry_cfg, "jitter_factor", 0.25),
+            max_429_retries=cfg_int(retry_cfg, "max_429_retries", 3),
         )
 
         def _invoke():
@@ -381,6 +382,12 @@ class QwenClient:
             output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens,
             cache_creation_tokens=usage.cache_write_tokens,
+            # Same as the Anthropic route: on QwenCloud's Anthropic-compatible
+            # endpoint input_tokens, cache_read_input_tokens and
+            # cache_creation_input_tokens are disjoint (documented example:
+            # input_tokens 369 beside cache_read_input_tokens 896). Subtracting
+            # the reads again under-billed every cached call.
+            cache_read_included_in_input=False,
             cache_pricing_mode=self._cache_pricing_mode,
         )
         self._record_cache_telemetry(usage)
@@ -419,7 +426,11 @@ class QwenClient:
         self._cache_telemetry["cache_creation_tokens"] = int(self._cache_telemetry.get("cache_creation_tokens", 0)) + usage.cache_write_tokens
         self._cache_telemetry["input_tokens"] = int(self._cache_telemetry.get("input_tokens", 0)) + usage.input_tokens
         self._cache_telemetry["output_tokens"] = int(self._cache_telemetry.get("output_tokens", 0)) + usage.output_tokens
-        input_tokens = max(1, int(self._cache_telemetry["input_tokens"]))
+        # input_tokens excludes cache reads/writes here, so the ratio's
+        # denominator is the sum of all three (it could exceed 100% before).
+        input_tokens = max(1, int(self._cache_telemetry["input_tokens"])
+                           + int(self._cache_telemetry["cache_read_tokens"])
+                           + int(self._cache_telemetry["cache_creation_tokens"]))
         hit_ratio = float(self._cache_telemetry["cache_read_tokens"]) / float(input_tokens)
         self._cache_telemetry["cache_hit_ratio"] = round(hit_ratio, 4)
         warn_threshold = float(((self._cfg.get("caching") or {}).get("cache_monitor") or {}).get("warn_threshold_cache_hit_ratio", 0.5))

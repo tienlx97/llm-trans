@@ -149,7 +149,7 @@ def _call_deepseek_turn(
 # Compaction-ladder checkpoint callback — required by
 # DeepSeekConversationManager.prepare_turn(), but structurally unreachable
 # under config.yaml's default prep.multi_turn.conversation.
-# recent_verbatim_chapters (15, i.e. >= the turn count MULTITURN_BLOCK_ORDER
+# recent_verbatim_chapters (16, i.e. >= the turn count MULTITURN_BLOCK_ORDER
 # ever produces): the ladder's paid rung only fires once turns exceed that
 # count. Implemented for real anyway rather than stubbed, so a user who tunes
 # that value down gets correct behavior instead of a crash.
@@ -415,7 +415,7 @@ def run_multiturn_prep(
     base_url = str(prep_cfg.get("endpoint", "https://api.deepseek.com/anthropic")).rstrip("/")
     timeout_seconds = float(prep_cfg.get("http_timeout_seconds", 900))
 
-    model = str(mt_cfg.get("flash_model", "deepseek-v4-flash"))
+    model = str(mt_cfg.get("flash_model", "deepseek-flash"))
     thinking_budget = int(mt_cfg.get("thinking_budget", 16000))
     effort = str(mt_cfg.get("effort", "high"))
     max_output_tokens = int(mt_cfg.get("max_output_tokens", 32000))

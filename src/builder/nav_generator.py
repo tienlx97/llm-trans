@@ -25,13 +25,13 @@ class TOCEntry:
         if self.children:
             children_html = "\n".join(child.to_html(indent + 1) for child in self.children)
             return f'''{spaces}<li>
-{spaces}  <a href="{self.href}">{escape(self.label)}</a>
+{spaces}  <a href="{escape(self.href)}">{escape(self.label)}</a>
 {spaces}  <ol>
 {children_html}
 {spaces}  </ol>
 {spaces}</li>'''
         else:
-            return f'{spaces}<li><a href="{self.href}">{escape(self.label)}</a></li>'
+            return f'{spaces}<li><a href="{escape(self.href)}">{escape(self.label)}</a></li>'
 
 
 @dataclass
@@ -137,88 +137,3 @@ class NavGenerator:
 {landmarks_html}
     </ol>
   </nav>'''
-
-
-def generate_nav(
-    output_path: Path,
-    book_title: str,
-    toc_entries: List[TOCEntry],
-    landmarks: Optional[List[Landmark]] = None,
-    lang_code: str = "en",
-    toc_title: str = "Table of Contents"
-) -> None:
-    """
-    Main function to generate nav.xhtml file.
-
-    Args:
-        output_path: Path to write nav.xhtml
-        book_title: Book title
-        toc_entries: List of TOC entries
-        landmarks: List of landmarks (optional)
-        lang_code: Language code
-        toc_title: Title for TOC section
-    """
-    generator = NavGenerator(lang_code)
-    generator.generate(output_path, book_title, toc_entries, landmarks, toc_title)
-
-
-def create_toc_entries_from_chapters(
-    chapters: List[dict],
-    include_cover: bool = True,
-    include_toc: bool = False
-) -> List[TOCEntry]:
-    """
-    Create TOC entries from chapter list.
-
-    Args:
-        chapters: List of chapter dicts with 'title', 'xhtml_filename'
-        include_cover: Include cover in TOC
-        include_toc: Include TOC page itself in TOC
-
-    Returns:
-        List of TOCEntry objects
-    """
-    entries = []
-
-    # Cover
-    if include_cover:
-        entries.append(TOCEntry(
-            label="Cover",
-            href="cover.xhtml"
-        ))
-
-    # TOC page
-    if include_toc:
-        entries.append(TOCEntry(
-            label="Table of Contents",
-            href="toc.xhtml"
-        ))
-
-    # Chapters
-    for i, chapter in enumerate(chapters):
-        title = chapter.get('title', f'Chapter {i+1}')
-        filename = chapter.get('xhtml_filename', f'chapter{i+1:03d}.xhtml')
-
-        entries.append(TOCEntry(
-            label=title,
-            href=filename
-        ))
-
-    return entries
-
-
-def create_default_landmarks(first_chapter_href: str = "chapter001.xhtml") -> List[Landmark]:
-    """
-    Create default landmarks for an EPUB.
-
-    Args:
-        first_chapter_href: Href to first chapter
-
-    Returns:
-        List of standard landmarks
-    """
-    return [
-        Landmark(epub_type="cover", href="cover.xhtml", title="Cover"),
-        Landmark(epub_type="toc", href="nav.xhtml", title="Table of Contents"),
-        Landmark(epub_type="bodymatter", href=first_chapter_href, title="Start of Content"),
-    ]

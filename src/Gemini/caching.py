@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.Deepseek.common.atomic_io import atomic_write_json
+from src.Deepseek.common.token_estimate import estimate_tokens
 from src.Deepseek.common.token_telemetry import _rates_for_model
 
 logger = logging.getLogger(__name__)
@@ -121,13 +122,14 @@ class GeminiContextCache:
         try:
             result = self.client.models.count_tokens(model=self.model, contents=contents or "")
             counted = int(getattr(result, "total_tokens", 0) or 0)
-            return counted + max(1, len(system_instruction) // 3)
+            return counted + estimate_tokens(system_instruction)
         except Exception as exc:  # noqa: BLE001 - estimate is good enough to gate on
             logger.debug("[GEMINI-CACHE] count_tokens failed (%s); estimating", exc)
-            chars = len(system_instruction) + sum(
-                len(str(part.get("text") or "")) for item in contents for part in item.get("parts", [])
+            # Character-length rules under-count the Japanese in replayed
+            # chapters; see token_estimate.
+            return estimate_tokens(system_instruction) + sum(
+                estimate_tokens(str(part.get("text") or "")) for item in contents for part in item.get("parts", [])
             )
-            return max(1, chars // 3)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 

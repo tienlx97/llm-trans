@@ -45,6 +45,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+from src.Deepseek.common.config import cfg_float, cfg_int
 from src.Deepseek.common.llm_types import LLMApiFamily, LLMResponse
 from src.Deepseek.common.token_telemetry import cost_breakdown_usd
 from src.Gemini.config import get_gemini_config, get_gemini_long_context_config, get_gemini_long_decode_config
@@ -413,12 +414,12 @@ class GeminiClient:
 
         retry_cfg = self._cfg.get("retry", {}) or {}
         policy = RetryPolicy(
-            max_retries=int(retry_cfg.get("max_retries", 5) or 5),
+            max_retries=cfg_int(retry_cfg, "max_retries", 5),
             base_delay_ms=int(retry_cfg.get("base_delay_ms", 1000) or 1000),
             max_delay_ms=int(retry_cfg.get("max_delay_ms", 60_000) or 60_000),
-            jitter_factor=float(retry_cfg.get("jitter_factor", 0.25) or 0.25),
-            max_429_retries=int(retry_cfg.get("max_429_retries", 4) or 4),
-            max_503_retries=int(retry_cfg.get("max_503_retries", 4) or 4),
+            jitter_factor=cfg_float(retry_cfg, "jitter_factor", 0.25),
+            max_429_retries=cfg_int(retry_cfg, "max_429_retries", 4),
+            max_503_retries=cfg_int(retry_cfg, "max_503_retries", 4),
         )
         on_retry = lambda attempt, err, delay: logger.warning(  # noqa: E731
             "[GEMINI-RETRY] attempt=%d delay=%.2fs error=%s", attempt, delay, err

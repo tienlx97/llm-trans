@@ -14,16 +14,11 @@ features absent in the DeepSeek API:
      DeepSeek's reasoning style — explicit contraction rewrite rules,
      "show don't tell" demonstration blocks, character archetype anchoring.
 
-  3. Concurrent Chapter Translation (CCT)
-     Async chapter processor for parallel translation when Anthropic
-     Batch API is unavailable on the DeepSeek route.
-
 All methods are pure functions — no side effects, no imports beyond stdlib.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from xml.etree import ElementTree as ET
 from typing import Any, Dict, List, Optional
@@ -242,61 +237,6 @@ def build_deepseek_voice_collective_block(
         + "\n".join(blocks)
         + "\n</deepseek_voice_profiles>"
     )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. CONCURRENT CHAPTER TRANSLATION (CCT)
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-async def translate_chapters_concurrent(
-    chapters: List[Dict[str, Any]],
-    processor_factory,
-    max_concurrent: int = 3,
-) -> List[Dict[str, Any]]:
-    """
-    Translate multiple chapters concurrently using asyncio semaphore.
-
-    DeepSeek lacks Anthropic's Batch API. This closes the throughput gap
-    by parallelizing independent chapter translations.
-
-    Args:
-        chapters: List of chapter dicts, each with at least 'chapter_id'
-                  and any other keys needed by the processor.
-        processor_factory: Callable that returns a chapter processor callable.
-                           Signature: processor_factory() -> callable(chapter_dict) -> result_dict
-        max_concurrent: Max concurrent chapter translations (default 3).
-
-    Returns:
-        List of result dicts in original chapter order.
-    """
-    if not chapters:
-        return []
-
-    semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def _process_one(chapter: Dict[str, Any], index: int) -> Dict[str, Any]:
-        async with semaphore:
-            chapter_id = chapter.get("chapter_id", f"chapter_{index}")
-            logger.info(
-                "[DEEPSEEK-CCT] Starting chapter %s (slot %d/%d)",
-                chapter_id, index + 1, len(chapters),
-            )
-            try:
-                processor = processor_factory()
-                result = await asyncio.to_thread(processor, chapter)
-                logger.info("[DEEPSEEK-CCT] Completed chapter %s", chapter_id)
-                return {"chapter_id": chapter_id, "index": index, "success": True, "result": result}
-            except Exception as e:
-                logger.error("[DEEPSEEK-CCT] Chapter %s failed: %s", chapter_id, e)
-                return {"chapter_id": chapter_id, "index": index, "success": False, "error": str(e)}
-
-    tasks = [_process_one(ch, i) for i, ch in enumerate(chapters)]
-    results = await asyncio.gather(*tasks)
-
-    # Sort back to original order
-    results.sort(key=lambda r: r["index"])
-    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════

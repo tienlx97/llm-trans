@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List, Tuple, Set
 from dataclasses import dataclass, field, asdict
 import re
+from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 
 from .epub_extractor import EPUBExtractor, ExtractionResult, extract_opf_metadata
@@ -23,12 +24,6 @@ from .image_extractor import ImageExtractor, catalog_images
 from .content_splitter import ContentSplitter, KodanshaSplitter
 from .config import get_volume_structure, get_work_dir, get_pre_toc_detection_config
 from .publisher_profiles.manager import get_profile_manager, PublisherProfile
-
-# Phase 1.55: Reference Validator — stripped from the lightweight client.
-# post_processor was never copied here, so this path is permanently disabled
-# rather than a real optional-import fallback.
-compile_reference_payloads = None
-REFERENCE_VALIDATOR_AVAILABLE = False
 
 
 @dataclass
@@ -85,9 +80,10 @@ class Manifest:
         return asdict(self)
 
     def save(self, path: Path):
-        """Save manifest to JSON file."""
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+        """Save manifest to JSON file (atomically: a truncated manifest loses the volume's state)."""
+        from src.Deepseek.common.atomic_io import atomic_write_json
+
+        atomic_write_json(path, self.to_dict())
 
     @classmethod
     def load(cls, path: Path) -> 'Manifest':
@@ -192,7 +188,6 @@ class LibrarianAgent:
         volume_id: Optional[str] = None,
         source_lang: str = "ja",
         target_lang: str = "en",
-        validate_references: bool = False,
         force_rerun: bool = False,
     ) -> Manifest:
         """
@@ -597,14 +592,6 @@ class LibrarianAgent:
         if filtered_illustrations:
             print(f"     Hard-filtered {filtered_illustrations} excluded inline image references")
 
-        # Phase 1.55: Validate real-world references in source chapters (optional, off by default).
-        # Keep this after asset copy so a slow/failed validator does not block asset extraction.
-        if validate_references:
-            print("\n[PHASE 1.55] Validating real-world references...")
-            self._validate_references_in_chapters(chapters, source_dir)
-        else:
-            print("\n[PHASE 1.55] Reference validation skipped (use --ref-validate to enable)")
-
         # Update illustration references in markdown files
         if filename_mapping:
             print(f"\n[POST-PROCESS] Updating illustration references...")
@@ -701,75 +688,6 @@ class LibrarianAgent:
 
         return manifest
 
-    def _convert_chapters(
-        self,
-        content_dir: Path,
-        output_dir: Path,
-        chapter_order: List[str],
-        toc: TableOfContents,
-        converter: XHTMLToMarkdownConverter
-    ) -> List[ConvertedChapter]:
-        """Convert XHTML chapters to markdown files."""
-        chapters = []
-        titles = {np.content_src: np.label for np in toc.get_flat_list()}
-
-        # Track processed files to avoid duplicates
-        processed = set()
-
-        for ref in chapter_order:
-            # Handle fragment references (file.xhtml#id)
-            filename = ref.split('#')[0]
-            if filename in processed:
-                continue
-
-            xhtml_path = content_dir / filename
-            if not xhtml_path.exists():
-                # Try in subdirectories
-                for sub in ['text', 'Text', 'xhtml', 'XHTML']:
-                    alt_path = content_dir / sub / filename
-                    if alt_path.exists():
-                        xhtml_path = alt_path
-                        break
-
-            if not xhtml_path.exists():
-                print(f"     [SKIP] Not found: {filename}")
-                continue
-
-            # Skip navigation, cover, and toc files
-            lower_name = filename.lower()
-            if any(skip in lower_name for skip in ['nav', 'toc', 'cover', 'copyright']):
-                print(f"     [SKIP] Navigation/cover: {filename}")
-                continue
-            if self._is_non_content_xhtml_file(xhtml_path):
-                print(f"     [SKIP] Non-content XHTML: {filename}")
-                continue
-
-            try:
-                # Get title from TOC
-                title = titles.get(ref, titles.get(filename, ""))
-
-                # Convert
-                chapter = converter.convert_file(xhtml_path, title)
-
-                # Save markdown
-                md_filename = self._make_markdown_filename(filename, len(chapters) + 1)
-                md_path = output_dir / md_filename
-
-                with open(md_path, 'w', encoding='utf-8') as f:
-                    f.write(chapter.content)
-
-                # Update chapter info
-                chapter.filename = md_filename
-                chapters.append(chapter)
-                processed.add(filename)
-
-                print(f"     [OK] {filename} -> {md_filename}")
-
-            except Exception as e:
-                print(f"     [FAIL] {filename}: {e}")
-
-        return chapters
-
     def _convert_chapters_with_spine(
         self,
         content_dir: Path,
@@ -801,6 +719,7 @@ class LibrarianAgent:
         import re
         profile_manager = get_profile_manager()
         chapters = []
+        failed_chapters: List[str] = []
 
         # Build TOC entry map: normalized filename -> (title, TOC entry)
         toc_entries = {}
@@ -965,7 +884,14 @@ class LibrarianAgent:
 
             except Exception as e:
                 print(f"     [FAIL] {chapter_title}: {e}")
+                failed_chapters.append(f"{chapter_title}: {e}")
 
+        # A chapter that failed conversion used to be skipped silently: the
+        # extraction "succeeded", the manifest never listed the chapter, and
+        # QC/build had no way to notice the book was missing it. Every other
+        # chapter is still converted above (useful for diagnosis), then the
+        # extraction stops loudly.
+        _raise_on_failed_chapters(failed_chapters)
         return chapters
 
     def _convert_chapters_from_spine(
@@ -999,6 +925,7 @@ class LibrarianAgent:
         import re
 
         chapters = []
+        failed_chapters: List[str] = []
         profile_manager = get_profile_manager()
         title_patterns = profile_manager.get_chapter_title_patterns(publisher)
         content_config = profile_manager.get_content_config(publisher)
@@ -1300,7 +1227,14 @@ class LibrarianAgent:
 
             except Exception as e:
                 print(f"     [FAIL] {chapter_title}: {e}")
+                failed_chapters.append(f"{chapter_title}: {e}")
 
+        # A chapter that failed conversion used to be skipped silently: the
+        # extraction "succeeded", the manifest never listed the chapter, and
+        # QC/build had no way to notice the book was missing it. Every other
+        # chapter is still converted above (useful for diagnosis), then the
+        # extraction stops loudly.
+        _raise_on_failed_chapters(failed_chapters)
         return chapters
 
     def _is_fallback_chapter_title(self, title: str, fallback_template: str) -> bool:
@@ -2434,7 +2368,9 @@ class LibrarianAgent:
                 for element in body.iter():
                     if char_count > 200:  # Stop early if we already have enough text
                         break
-                    if element.tag.endswith(('img', 'image')):
+                    # Comments/PIs have a non-string .tag; .endswith() on one raised
+                    # and the except below silently dropped the whole kuchie page.
+                    if not isinstance(element.tag, str) or element.tag.endswith(('img', 'image')):
                         continue
                     if element.text:
                         text_parts.append(element.text.strip())
@@ -2467,7 +2403,7 @@ class LibrarianAgent:
                     # Extract image filename
                     img_src = None
                     for img in img_elements:
-                        src = img.get('src') or img.get('{http://www.w3.org/1999/xlink}href')
+                        src = unquote(img.get('src') or img.get('{http://www.w3.org/1999/xlink}href') or '')
                         if src:
                             # Resolve relative path from XHTML location
                             xhtml_dir = Path(spine_item.href).parent
@@ -2600,15 +2536,15 @@ class LibrarianAgent:
 
                 refs: List[str] = []
                 for img in body.findall(".//{http://www.w3.org/1999/xhtml}img"):
-                    src = img.get("src")
+                    src = unquote(img.get("src") or "")
                     if src:
                         refs.append(src)
                 for img in body.findall(".//img"):
-                    src = img.get("src")
+                    src = unquote(img.get("src") or "")
                     if src:
                         refs.append(src)
                 for img in body.findall(".//{http://www.w3.org/2000/svg}image"):
-                    src = img.get("{http://www.w3.org/1999/xlink}href") or img.get("href")
+                    src = unquote(img.get("{http://www.w3.org/1999/xlink}href") or img.get("href") or "")
                     if src:
                         refs.append(src)
 
@@ -3005,7 +2941,7 @@ class LibrarianAgent:
                     # Check <img> elements
                     for ns_prefix in ['{http://www.w3.org/1999/xhtml}', '']:
                         for img in body.findall(f".//{ns_prefix}img"):
-                            src = img.get('src')
+                            src = unquote(img.get('src') or '')
                             if src:
                                 img_src = self._resolve_image_path(spine_item.href, src)
                                 break
@@ -3015,7 +2951,7 @@ class LibrarianAgent:
                     # Check SVG <image> elements
                     if not img_src:
                         for img in body.findall(".//{http://www.w3.org/2000/svg}image"):
-                            src = img.get('{http://www.w3.org/1999/xlink}href') or img.get('href')
+                            src = unquote(img.get('{http://www.w3.org/1999/xlink}href') or img.get('href') or '')
                             if src:
                                 img_src = self._resolve_image_path(spine_item.href, src)
                                 break
@@ -3079,110 +3015,6 @@ class LibrarianAgent:
             elif part != '.':
                 resolved.append(part)
         return '/'.join(resolved)
-
-    def _validate_references_in_chapters(
-        self,
-        chapters: List['ConvertedChapter'],
-        source_dir: Path
-    ):
-        """
-        Validate real-world references in converted chapters using Phase 1.55 Reference Validator.
-
-        This detects and logs:
-        - Author names (デボラ・ザック → Devora Zack)
-        - Book titles (『シングルタスク』→ Singletasking)
-        - Celebrity/person names (タ○ソン → Mike Tyson)
-        - Brand names (LIME → LINE, MgRonald's → McDonald's)
-        - Place names (ニューヨーク → New York)
-
-        Args:
-            chapters: List of converted chapters
-            source_dir: Directory where source markdown files are saved
-        """
-        if not REFERENCE_VALIDATOR_AVAILABLE:
-            print("     [SKIP] Reference Validator not available (optional feature)")
-            return
-
-        try:
-            validator = ReferenceValidator(enable_wikipedia=False)  # Skip Wikipedia per user request
-
-            # Create .context folder for validation reports (not in JP source folder)
-            context_dir = source_dir.parent / '.context'
-            context_dir.mkdir(parents=True, exist_ok=True)
-            # Clean legacy per-chapter reference reports so output remains unified-only.
-            for legacy in context_dir.glob("*.references.json"):
-                try:
-                    legacy.unlink()
-                except Exception:
-                    pass
-            for legacy in context_dir.glob("CHAPTER_*.json"):
-                name = legacy.name
-                if "_SUMMARY.json" in name or "_VOLUME_CONTEXT.json" in name:
-                    continue
-                try:
-                    payload = json.loads(legacy.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if (
-                    isinstance(payload, dict)
-                    and {"file_path", "total_entities_detected", "entities"}.issubset(payload.keys())
-                ):
-                    try:
-                        legacy.unlink()
-                    except Exception:
-                        pass
-
-            total_entities = 0
-            total_obfuscated = 0
-            chapter_reports: List[Tuple[str, Dict[str, Any]]] = []
-
-            for chapter in chapters:
-                # Read chapter markdown file
-                chapter_path = source_dir / chapter.filename
-
-                if not chapter_path.exists():
-                    continue
-
-                # Validate references
-                report = validator.validate_file(chapter_path)
-                chapter_reports.append((chapter_path.name, report.to_dict()))
-
-                if report.total_entities_detected > 0:
-                    print(f"       {chapter.filename}: {report.total_entities_detected} entities "
-                          f"({report.obfuscated_entities} obfuscated)")
-
-                    # Log high-confidence entities that need correction
-                    for entity in report.entities:
-                        if entity.is_obfuscated and entity.confidence >= 0.95:
-                            print(f"         → {entity.detected_term} → {entity.real_name} "
-                                  f"({entity.entity_type}, {entity.confidence:.2f})")
-
-                    total_entities += report.total_entities_detected
-                    total_obfuscated += report.obfuscated_entities
-
-            if total_entities > 0:
-                print(f"     Total: {total_entities} real-world references detected "
-                      f"({total_obfuscated} need correction)")
-                if compile_reference_payloads:
-                    output_path = context_dir / "reference_registry.json"
-                    compiled = compile_reference_payloads(
-                        chapter_reports,
-                        output_path=output_path,
-                        min_confidence=0.70,
-                    )
-                    print(
-                        f"     Unified reference registry: {output_path.name} "
-                        f"({compiled.get('unique_entities', 0)} unique entities, "
-                        f"{compiled.get('unique_deobfuscation_terms', 0)} deobfuscation mappings)"
-                    )
-            else:
-                print("     No real-world references detected")
-
-        except Exception as e:
-            print(f"     [WARNING] Reference validation failed: {e}")
-            # Don't fail the entire pipeline if reference validation fails
-            import traceback
-            traceback.print_exc()
 
     def _find_cover_from_spine_kuchie(self, spine_kuchie: List[Dict[str, Any]]) -> Optional[str]:
         """
@@ -3412,7 +3244,6 @@ class LibrarianAgent:
         volume_structure_data = {}
         if volume_acts and len(volume_acts) >= 2:
             # Map acts to chapter ranges using TOC indices
-            toc_flat = toc.get_flat_list()
             act_details = []
             for i, act in enumerate(volume_acts):
                 toc_idx = act.get('toc_index', 0)
@@ -3465,6 +3296,14 @@ class LibrarianAgent:
         )
 
 
+def _raise_on_failed_chapters(failed: List[str]) -> None:
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)} chapter(s) failed to convert; refusing to produce a volume that "
+            "silently lacks them: " + "; ".join(failed)
+        )
+
+
 def _declares_authoritative_toc(opf_path: Path) -> bool:
     """True when the package carries ``<meta property="mtl:toc-authoritative">true</meta>``."""
     try:
@@ -3474,67 +3313,12 @@ def _declares_authoritative_toc(opf_path: Path) -> bool:
     return bool(re.search(r'property="mtl:toc-authoritative"[^>]*>\s*true\s*<', text))
 
 
-def _build_volume_number(
-    series_index: Any,
-    series_name: Any,
-) -> List[Dict[str, Any]]:
-    """Build the top-level volume_number array from OPF series metadata.
-
-    Rules:
-    - If series_index is a number, emit one entry with scheme="series".
-    - If series_name is set but series_index is null, emit one entry with value=None
-      so downstream knows this is a series volume without a resolved number.
-    - If neither is set, return [] (standalone volume).
-
-    Args:
-        series_index: Raw series_index value from OPF (float, int, str, or None).
-        series_name:  Raw series string from OPF (str or None).
-
-    Returns:
-        List of volume-number entry dicts.
-    """
-    entries: List[Dict[str, Any]] = []
-
-    raw_index = series_index
-    # Normalise: "2.0" → 2, 2.0 → 2, None / "" → None
-    int_value: Optional[int] = None
-    if raw_index is not None and str(raw_index).strip() not in ("", "None"):
-        try:
-            float_val = float(raw_index)
-            int_value = int(float_val) if float_val == int(float_val) else int(float_val)
-        except (TypeError, ValueError):
-            int_value = None
-
-    has_series = bool(series_name and str(series_name).strip())
-
-    if int_value is not None:
-        entries.append({
-            "scheme": "series",
-            "value": int_value,
-            "display": f"Vol. {int_value}",
-            "source": "opf",
-        })
-    elif has_series:
-        # Known series but index unresolved — emit a placeholder so the artifact
-        # records series affiliation without a concrete number.
-        entries.append({
-            "scheme": "series",
-            "value": None,
-            "display": None,
-            "source": "opf",
-        })
-    # else: standalone — return []
-
-    return entries
-
-
 def run_librarian(
     epub_path: Path,
     volume_id: Optional[str] = None,
     work_base: Optional[Path] = None,
     source_lang: str = "ja",
     target_lang: str = "en",
-    validate_references: bool = False,
     force_rerun: bool = False,
 ) -> Manifest:
     """
@@ -3546,7 +3330,6 @@ def run_librarian(
         work_base: Optional custom working directory
         source_lang: Source language code
         target_lang: Target language code
-        validate_references: Run Phase 1.55 real-world reference validator (default: False)
         force_rerun: Auto-continue re-extractions into a NEW derived volume
             directory (old output preserved) instead of prompting
 
@@ -3554,7 +3337,7 @@ def run_librarian(
         Manifest object with extraction results
     """
     agent = LibrarianAgent(work_base)
-    return agent.process_epub(epub_path, volume_id, source_lang, target_lang, validate_references=validate_references, force_rerun=force_rerun)
+    return agent.process_epub(epub_path, volume_id, source_lang, target_lang, force_rerun=force_rerun)
 
 
 # CLI interface
@@ -3582,8 +3365,6 @@ if __name__ == "__main__":
     parser.add_argument("--source-lang", "-s", type=str, default="ja", help="Source language code")
     parser.add_argument("--target-lang", "-t", type=str, default=default_target,
                         help=f"Target language code (default: {default_target} from config.yaml)")
-    parser.add_argument("--ref-validate", dest="ref_validate", action="store_true", default=False,
-                        help="Run Phase 1.55 real-world reference validator after extraction (default: off)")
     parser.add_argument("--force-rerun", dest="force_rerun", action="store_true", default=False,
                         help="Re-extracting over a workspace with translations proceeds automatically "
                              "into a NEW derived volume directory (old output preserved) without "
@@ -3597,7 +3378,6 @@ if __name__ == "__main__":
         work_base=args.work_dir,
         source_lang=args.source_lang,
         target_lang=args.target_lang,
-        validate_references=args.ref_validate,
         force_rerun=args.force_rerun,
     )
 

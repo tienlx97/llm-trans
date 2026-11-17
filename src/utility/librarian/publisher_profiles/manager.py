@@ -252,7 +252,6 @@ class PublisherProfileManager:
                         image_patterns=image_patterns_converted,
                         content_config=ContentConfig.from_dict(individual_data.get("content_structure", {})),
                     )
-                    print(f"[OK] Loaded {pub_name} from {json_filename}")
                 except Exception as e:
                     print(f"[WARNING] Failed to load {json_filename}: {e}")
                     print(f"          Falling back to publisher_database.json for {pub_name}")

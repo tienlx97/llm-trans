@@ -10,8 +10,8 @@
 
 import { unquoteYamlScalar } from './configSchema.js';
 
-// Mirror of ADVISOR_COMPATIBILITY in src/Anthropic/client.py. tests/run.ts
-// parses client.py and fails if the two drift, so update both together.
+// Mirror of ADVISOR_COMPATIBILITY in src/Anthropic/client.py.
+// tests/unit/test_console_mirrors.py (pytest) fails if the two drift.
 export const ADVISOR_COMPATIBILITY: Readonly<Record<string, readonly string[]>> = {
   'claude-opus-5-5': [
     'claude-opus-5-5', 'claude-mythos-5-1', 'claude-fable-5-1',

@@ -1,10 +1,8 @@
 """Translator phase MCP tools calling the configured Phase 2 provider.
 
 Everything the original translator server exposed beyond this (parallel
-dispatch, Koji Fox / VN voice validators, series bible RAG, volume context
-aggregation) belongs to modules deliberately excluded from the lightweight
-client (see PLANNING.md Phase 4 "DELIBERATELY REMOVED" and the exclusion
-inventory). There is no subprocess CLI to shell out to here — provider
+dispatch, voice validators, series bible RAG, volume context aggregation)
+belongs to modules deliberately excluded from the lightweight client. There is no subprocess CLI to shell out to here — provider
 facades expose the same in-process filesystem contract.
 """
 
@@ -14,7 +12,8 @@ from typing import List, Optional
 
 from src.Deepseek.mcp.mcp_config import MCPConfig
 from src.Deepseek.mcp.runtime import MCPRuntimeError, load_manifest, resolve_volume_dir
-from src.Deepseek.translator.provider import get_translator_class, get_volume_translator
+from src.Deepseek.common.language import require_provider_support, volume_target_language
+from src.Deepseek.translator.provider import configured_provider, get_translator_class, get_volume_translator
 
 
 def register_translator_tools(mcp: object, cfg: MCPConfig) -> None:
@@ -27,6 +26,14 @@ def register_translator_tools(mcp: object, cfg: MCPConfig) -> None:
         volume_dir = resolve_volume_dir(volume_id, cfg)
         jp_dir = volume_dir / "JP"
         chapter_path = _resolve_jp_chapter(jp_dir, chapter_id)
+
+        # Some routes check language support only inside translate_volume;
+        # building the translator class directly would skip that and write
+        # English into a non-English workspace.
+        try:
+            require_provider_support(configured_provider(), volume_target_language(volume_dir))
+        except ValueError as exc:
+            raise MCPRuntimeError(str(exc)) from exc
 
         translator = get_translator_class()(
             work_dir=volume_dir, volume_id=volume_id, thinking_log_enabled=thinking_log, dry_run=dry_run,

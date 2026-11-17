@@ -9,6 +9,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
+from src.Deepseek.common.config import cfg_float, cfg_int
 from src.Deepseek.common.llm_types import LLMApiFamily, LLMResponse
 from src.Deepseek.common.chapter_signals import normalize_reasoning_effort
 from src.Deepseek.common.token_telemetry import cost_breakdown_usd
@@ -231,11 +232,11 @@ class OpenAIClient:
 
         retry_cfg = cfg.get("retry", {}) or {}
         policy = RetryPolicy(
-            max_retries=int(retry_cfg.get("max_retries", 5) or 5),
+            max_retries=cfg_int(retry_cfg, "max_retries", 5),
             base_delay_ms=int(retry_cfg.get("base_delay_ms", 500) or 500),
             max_delay_ms=int(retry_cfg.get("max_delay_ms", 32_000) or 32_000),
-            jitter_factor=float(retry_cfg.get("jitter_factor", 0.25) or 0.25),
-            max_429_retries=int(retry_cfg.get("max_429_retries", 3) or 3),
+            jitter_factor=cfg_float(retry_cfg, "jitter_factor", 0.25),
+            max_429_retries=cfg_int(retry_cfg, "max_429_retries", 3),
         )
 
         def invoke() -> LLMResponse:

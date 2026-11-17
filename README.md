@@ -5,7 +5,8 @@ light novel translation. Extract (an EPUB, or a Syosetu/Kakuyomu URL), prep,
 translate, QC, build — and remember the series for next time.
 
 Phase 2 selects one isolated translation route through `translation.provider`:
-`deepseek`, `qwen`, `openai`, `anthropic`, or `gemini`. Each route owns its native
+`deepseek`, `qwen`, `openai`, `anthropic`, or `gemini` (plus `codex` / `claude`
+for the signed-in subscription CLIs). Each route owns its native
 client, prompt, conversation ledger, cache policy, continuation behavior, and
 error handling; selecting one does not silently alter any of the others.
 
@@ -93,7 +94,7 @@ venv\Scripts\activate   # Windows
 pip install -r requirements.txt
 
 # 4. Set your API key(s) in .env, matching whichever provider(s) you use:
-#    DEEPSEEK_API_KEY, QWEN_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY
+#    DEEPSEEK_API_KEY, DASHSCOPE_API_KEY (Qwen), OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY
 #    (or no key at all with --provider codex / --provider claude, see
 #    "Without an API key" below)
 
@@ -473,7 +474,7 @@ evidence trail. The chain's result folds into the conversation's stable
 system prefix as grounding evidence and is persisted to
 `.context/prep_web_search.json` for audit.
 
-Every model turn — prep's fifteen and the search chain's provider calls
+Every model turn — prep's sixteen and the search chain's provider calls
 alike — writes a row to the per-volume cost ledger under
 `work/<volume_id>/LOG/`.
 
@@ -491,6 +492,13 @@ On the *next* volume of a series, prep matches its JP title against every
 `series_pack.json`; a match loads the bible and injects it so the model
 reuses locked names and voices instead of reinventing them. Writing the bible
 is deliberately MCP/IDE-agent-only, not a CLI command.
+
+> **Known gap.** The writer's implementation (`src/utility/bible/`) is not in
+> this repository: an unanchored `bible/` rule in `.gitignore` excluded it
+> from every commit (the rule is now `/bible/`). Until that package is
+> committed, the `write_bible` MCP tool reports itself unavailable; the
+> server and its other tools are unaffected, and prep still *reads* an
+> existing `bibles/<series_id>/`.
 
 ---
 
@@ -964,15 +972,17 @@ llm-trans/
 ├── scripts/
 │   ├── mtl.py                   ← CLI (see CLI Reference)
 │   ├── reinject_illustrations.py← Re-insert illustration tags into a translated volume
-│   ├── ocr_extract.py, run_ocr.ps1, ocr_test_*.py  ← Optional JP OCR for page scans
+│   ├── ocr_extract.py           ← Optional JP OCR for page scans (manga-ocr / PaddleOCR)
 │   └── convert_agent_assets.py, validate_agent_assets.py  ← Agent/skill asset tooling
 │
 ├── tests/                       ← unit/ + integration/ (offline by default)
 └── ts/                          ← TypeScript Ink/React terminal console (optional)
 ```
 
-`raw/`, `work/`, `output/`, `bibles/` and `logs/` are created at run time and
-are not part of the repository.
+`raw/`, `work/`, `output/` and `bibles/` are created at run time and are not
+part of the repository. `workflows/qc-gate.wf.mjs` and the two
+`*_agent_assets.py` scripts operate on local-only agent/skill assets
+(`.github/`, `.agents/`), which `.gitignore` keeps out of the repository.
 
 ---
 
@@ -1052,7 +1062,10 @@ calls one tool per phase instead of manually orchestrating sub-steps.
 | Builder | `run_builder`, `package_epub`, `markdown_to_xhtml`, `generate_opf`, `generate_nav`, `merge_translated_shards`, `optimize_image` | 4 |
 
 Start the server: `python -m src.Deepseek.mcp.server` (Python MCP SDK 2.x).
-`.mcp.json` already registers it for Claude Code as `llm-translator`.
+`.mcp.json` already registers it for Claude Code as `llm-translator`; it
+launches the bare `python` on PATH, so that interpreter needs
+`requirements.txt` installed (a missing `mcp` package shows up as
+"Connection closed").
 
 ---
 
@@ -1083,6 +1096,7 @@ sequential conversation. Root shape:
   <opf_metadata format="json">{...raw OPF passthrough...}</opf_metadata>
   <validation_audit status="passed">...</validation_audit>
   <volume_identity>...</volume_identity>
+  <chapter_titles_en>...</chapter_titles_en>
   <world_setting type="...">...</world_setting>
   <character_roster>...</character_roster>
   <name_map>...</name_map>
@@ -1094,6 +1108,7 @@ sequential conversation. Root shape:
   <eps_arc_tracker>...</eps_arc_tracker>
   <scene_plans>...</scene_plans>
   <eps_signals>...</eps_signals>
+  <chapter_signals>...</chapter_signals>
   <illustration_context>...</illustration_context>
   <translation_brief>...</translation_brief>
   <translation_inheritance status="pending"><pending/></translation_inheritance>

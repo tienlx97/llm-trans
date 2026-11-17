@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.Deepseek.common.chapter_order import in_reading_order
 from src.utility.vietnamese.bible import (
     load_volume_bible,
     merge_character,
@@ -174,8 +174,7 @@ def analyze_volume(work_dir: Path, assistant, *, batch_chars: int = 40000,
     bible = load_volume_bible(work_dir) or empty_bible(volume_id=work_dir.name)
     # Story order (CHAPTER_9 < CHAPTER_10 < CHAPTER_100): each batch must see
     # only what earlier chapters established.
-    jp_files = sorted((work_dir / "JP").glob("*.md"),
-                      key=lambda p: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", p.stem)])
+    jp_files = in_reading_order((work_dir / "JP").glob("*.md"))
     if chapters:
         wanted = set(chapters)
         jp_files = [p for p in jp_files if p.stem in wanted]

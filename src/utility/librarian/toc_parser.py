@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
+from urllib.parse import unquote
+
 from lxml import etree
 
 from .config import get_metadata_namespaces
@@ -141,7 +143,7 @@ class TOCParser:
                 # Find item with properties="nav"
                 for item in root.findall(".//opf:item", ns):
                     if "nav" in item.get("properties", ""):
-                        href = item.get("href")
+                        href = unquote(item.get("href") or "")
                         if href:
                             nav_path = opf_path.parent / href
                             if nav_path.exists():
@@ -150,7 +152,7 @@ class TOCParser:
                 # Try without namespace
                 for item in root.findall(".//item"):
                     if "nav" in item.get("properties", ""):
-                        href = item.get("href")
+                        href = unquote(item.get("href") or "")
                         if href:
                             nav_path = opf_path.parent / href
                             if nav_path.exists():
@@ -219,7 +221,9 @@ class TOCParser:
         if nav_elem is not None:
             # Extract title from h2 or h1
             for heading in nav_elem.iter():
-                if heading.tag.endswith(('h1', 'h2', 'h3')):
+                # Comments and processing instructions carry a function, not a
+                # string, as .tag; .endswith() on one raised and aborted the parse.
+                if isinstance(heading.tag, str) and heading.tag.endswith(('h1', 'h2', 'h3')):
                     toc.title = self._get_text(heading)
                     break
 
@@ -239,7 +243,7 @@ class TOCParser:
         play_order = 0
 
         for li in ol_elem:
-            if not li.tag.endswith("li"):
+            if not isinstance(li.tag, str) or not li.tag.endswith("li"):
                 continue
 
             play_order += 1
@@ -250,7 +254,7 @@ class TOCParser:
                 a_elem = li.find(".//a")
 
             if a_elem is not None:
-                href = a_elem.get("href", "")
+                href = unquote(a_elem.get("href", ""))  # URL-encoded, like the spine hrefs
                 label = self._get_text(a_elem)
 
                 nav_point = NavPoint(
@@ -313,7 +317,7 @@ class TOCParser:
         ncx_ns = "{http://www.daisy.org/z3986/2005/ncx/}"
 
         for nav_point_elem in nav_map:
-            if not nav_point_elem.tag.endswith("navPoint"):
+            if not isinstance(nav_point_elem.tag, str) or not nav_point_elem.tag.endswith("navPoint"):
                 continue
 
             # Get attributes
@@ -330,7 +334,7 @@ class TOCParser:
             content_elem = nav_point_elem.find(f"{ncx_ns}content")
             if content_elem is None:
                 content_elem = nav_point_elem.find("ncx:content", self.NCX_NS)
-            content_src = content_elem.get("src", "") if content_elem is not None else ""
+            content_src = unquote(content_elem.get("src", "")) if content_elem is not None else ""
 
             nav_point = NavPoint(
                 id=point_id,

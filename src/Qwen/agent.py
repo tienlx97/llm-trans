@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.Deepseek.common.atomic_io import atomic_write_json
+from src.Deepseek.common.chapter_order import in_reading_order
+from src.Deepseek.common.config import cfg_int
+from src.Deepseek.common.atomic_io import atomic_write_json, atomic_write_text
 from src.Deepseek.common.chapter_signals import build_chapter_signal_guidance, parse_chapter_signals
 from src.Deepseek.common.config import WORK_DIR, get_safety_fallback_config
 from src.Deepseek.common.llm_types import LLMTermination
@@ -67,7 +69,7 @@ class QwenTranslator:
         self.optimizations = get_qwen_optimization_config()
         continuation = get_qwen_continuation_config()
         self.continuation_enabled = bool(continuation.get("enabled", True))
-        self.max_continuations = max(0, int(continuation.get("max_continuations", 3) or 3))
+        self.max_continuations = max(0, cfg_int(continuation, "max_continuations", 3))
         self.use_partial_mode = bool(continuation.get("use_partial_mode", True))
 
     def translate_chapter(self, chapter_path: Path, chapter_meta: Optional[Dict[str, Any]] = None) -> str:
@@ -116,9 +118,10 @@ class QwenTranslator:
         self._log_usage(chapter_id, response, continuation_count)
         while response.termination == LLMTermination.MAX_OUTPUT and self.continuation_enabled and continuation_count < self.max_continuations:
             continuation_count += 1
-            thinking_enabled = bool((self._config.get("thinking") or {}).get("enabled", True))
-            use_partial = self.use_partial_mode and supports_partial_prefix(False, {"partial_prefix": True})
-            if use_partial and thinking_enabled:
+            # optimizations.partial_prefix is the operator's switch; it used to be
+            # shadowed here by a hardcoded {"partial_prefix": True}.
+            use_partial = self.use_partial_mode and supports_partial_prefix(False, self.optimizations)
+            if use_partial:
                 # Official Partial Mode forbids thinking; disable thinking for the continuation turn only.
                 partial_prefix = "".join(parts)
                 continuation_messages = (messages or [{"role": "user", "content": prompt}]) + [
@@ -131,7 +134,9 @@ class QwenTranslator:
                     partial=True,
                     thinking_enabled=False,
                 )
-                parts.append(response.content)
+                # Partial Mode resumes at the exact character the prefix ended
+                # on, so the fragment joins with no separator.
+                parts[-1] = parts[-1] + response.content
             else:
                 continuation_messages = build_continuation_messages(
                     messages or [{"role": "user", "content": prompt}],
@@ -166,7 +171,9 @@ class QwenTranslator:
                 messages or [{"role": "user", "content": prompt}],
                 text,
                 output_path,
-                response.provider_metadata.get("raw_content_blocks"),
+                # After a continuation `response` is only the last fragment;
+                # the ledger must replay the whole chapter, i.e. `text`.
+                response.provider_metadata.get("raw_content_blocks") if continuation_count == 0 else None,
             )
         return text
 
@@ -216,9 +223,11 @@ class QwenTranslator:
                 call_label=call_label,
                 model=response.model,
                 cache_hit_tokens=response.cached_tokens,
-                fresh_tokens=max(0, response.input_tokens - response.cached_tokens),
+                fresh_tokens=response.input_tokens,  # already excludes cache reads/writes on this endpoint
                 output_tokens=response.output_tokens,
+                cache_write_tokens=response.cache_creation_tokens,
                 cost_usd=response.total_cost_usd,
+                provider="qwen",  # the default ("deepseek") mislabelled every Qwen row
             )
         except Exception as exc:  # noqa: BLE001 - telemetry must never fail translation
             logger.warning("[QWEN] token log failed for %s: %s", call_label, exc)
@@ -278,12 +287,12 @@ class QwenTranslator:
             return self.work_dir / "DRY_RUN"
         output_path = self.work_dir / "EN" / f"{chapter_id}_EN.md"
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text, encoding="utf-8")
+        atomic_write_text(output_path, text)
         _update_manifest_after_translation(self.work_dir, {chapter_id})
         return output_path
 
     def translate_all(self, chapter_files: List[Path]) -> Dict[str, Path]:
-        return {path.stem: self.translate_and_persist_chapter(path, {"chapter_id": path.stem}) for path in sorted(chapter_files)}
+        return {path.stem: self.translate_and_persist_chapter(path, {"chapter_id": path.stem}) for path in in_reading_order(chapter_files)}
 
 
 def _update_manifest_after_translation(work_dir: Path, translated_stems: set[str]) -> None:
@@ -325,7 +334,7 @@ def translate_volume(volume_id: str, chapters: Optional[List[str]] = None, think
     jp_dir = work_dir / "JP"
     if not jp_dir.is_dir():
         raise FileNotFoundError(f"No JP/ directory for volume {volume_id!r} at {jp_dir}")
-    chapter_files = sorted(jp_dir.glob("CHAPTER_*.md"))
+    chapter_files = in_reading_order(jp_dir.glob("CHAPTER_*.md"))
     if chapters:
         wanted = set(chapters)
         chapter_files = [path for path in chapter_files if path.stem in wanted or path.stem.split("_")[-1] in wanted]

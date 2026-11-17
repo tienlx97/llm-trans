@@ -11,8 +11,10 @@ This is critical for EPUBs where:
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any
 from dataclasses import dataclass, field
+from urllib.parse import unquote
+
 from lxml import etree
 
 
@@ -167,7 +169,9 @@ class SpineParser:
 
         for item in items:
             item_id = item.get("id", "")
-            href = item.get("href", "")
+            # Manifest hrefs are URLs: "chapter%201.xhtml" names "chapter 1.xhtml"
+            # on disk, and every caller joins href onto a filesystem path.
+            href = unquote(item.get("href", ""))
             media_type = item.get("media-type", "")
             properties = item.get("properties", "")
 

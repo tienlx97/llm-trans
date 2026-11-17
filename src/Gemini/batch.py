@@ -252,7 +252,13 @@ def retrieve_batch_results(client, job_name: str, *, model: str, chapter_ids: Li
         content = sdk.files.download(file=dest.file_name)
         text = content.decode("utf-8") if isinstance(content, (bytes, bytearray)) else str(content)
         for index, line in enumerate(line for line in text.splitlines() if line.strip()):
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except ValueError:
+                # One unreadable line must not discard every other chapter's
+                # paid result; its chapter falls through to "missing" below.
+                logger.warning("[GEMINI-BATCH] %s: ignoring malformed result line #%d", job_name, index)
+                continue
             entries.append({"index": index, "key": str(record.get("key") or ""),
                             "response": record.get("response"), "error": record.get("error") or record.get("status")})
 

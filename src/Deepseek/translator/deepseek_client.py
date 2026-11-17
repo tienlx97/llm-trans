@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.Deepseek.common.llm_types import LLMApiFamily, LLMContentBlock, LLMResponse, LLMUsage
+from src.Deepseek.translator.config import get_retry_config as get_deepseek_retry_config
 from src.Deepseek.translator.deepseek_conversation import DeepSeekConversationManager
 from src.Deepseek.translator.thinking_output import split_analysis_prelude_from_output
 
@@ -377,7 +378,12 @@ class DeepSeekClient:
         return manager.commit_turn(
             chapter_id=chapter_id,
             user_prompt=str(pending.get("user_prompt") or ""),
-            assistant_response=str(pending.get("assistant_response") or ""),
+            # The staged turn belongs to the LAST call: after an output-cap
+            # continuation that is only the final fragment of the chapter, and
+            # replaying it would show later chapters a chapter missing its
+            # opening. Replay the shipped chapter text instead -- the same text
+            # _verify_canonical_outputs would rebuild the turn from on reload.
+            assistant_response=str(canonical_output or pending.get("assistant_response") or ""),
             canonical_output=canonical_output,
             output_path=Path(output_path),
             cache_telemetry=telemetry,
@@ -1206,6 +1212,40 @@ class DeepSeekClient:
         *,
         turn_kwargs: Dict[str, Any],
     ) -> DeepSeekTurnResult:
+        """One DeepSeek call, retried with backoff on transient failures only
+        (connection errors, 408/409/429, 5xx, 529 overloaded). The SDK client
+        is built with max_retries=0, so this is the route's only retry ladder;
+        translation.deepseek.retry tunes it."""
+        import random
+
+        import anthropic
+
+        retry_cfg = (get_deepseek_retry_config() or {})
+        max_retries = max(0, int(retry_cfg.get("max_retries", 3) if retry_cfg.get("max_retries") is not None else 3))
+        base_delay = max(0.0, float(retry_cfg.get("base_delay_ms", 2000) or 0)) / 1000.0
+        max_delay = max(base_delay, float(retry_cfg.get("max_delay_ms", 60000) or 0) / 1000.0)
+        attempt = 0
+        while True:
+            try:
+                return self._run_turn_once(turn_kwargs=turn_kwargs)
+            except (anthropic.APIConnectionError, anthropic.APIStatusError) as exc:
+                status = getattr(exc, "status_code", None)
+                transient = isinstance(exc, anthropic.APIConnectionError) or status in (408, 409, 429, 529) or (
+                    isinstance(status, int) and status >= 500
+                )
+                if not transient or attempt >= max_retries:
+                    raise
+                attempt += 1
+                delay = min(max_delay, base_delay * (2 ** (attempt - 1))) * random.uniform(0.75, 1.25)
+                logger.warning("[DEEPSEEK-RETRY] attempt %d/%d after %s (status=%s); sleeping %.1fs",
+                               attempt, max_retries, exc.__class__.__name__, status, delay)
+                time.sleep(delay)
+
+    def _run_turn_once(
+        self,
+        *,
+        turn_kwargs: Dict[str, Any],
+    ) -> DeepSeekTurnResult:
         """Execute one DeepSeek API call with streaming."""
         text_parts: List[str] = []
         thinking_parts: List[str] = []
@@ -1247,7 +1287,11 @@ class DeepSeekClient:
             )
         except Exception as e:
             logger.error("[DEEPSEEK-TURN] Stream failure: %s", e)
-            # Try non-streaming fallback
+            # Try non-streaming fallback. Drop whatever the broken stream had
+            # already delivered: the fallback returns the WHOLE answer, and
+            # appending it to a partial one duplicated the chapter's opening.
+            text_parts = []
+            thinking_parts = []
             logger.warning("[DEEPSEEK-TURN] Attempting non-streaming fallback...")
             fallback_kwargs = {
                 k: v for k, v in turn_kwargs.items()

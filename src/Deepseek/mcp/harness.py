@@ -9,9 +9,8 @@ local Claude Code session gets automatically from CLAUDE.md:
   routing://phases/{phase}  -> single phase's route (or an error payload)
 
 "Subagent routing" here means resolving a phase name (extract/prep/translate/
-qc/bible/build) to the one MCP tool that owns it — this client has a single
-model tier (DeepSeek V4 Pro/Flash) and no multi-LLM-agent orchestration layer
-to route between. It exists so a caller that only knows "I want to run prep"
+qc/bible/build) to the one MCP tool that owns it — there is no
+multi-LLM-agent orchestration layer to route between. It exists so a caller that only knows "I want to run prep"
 doesn't have to hardcode the tool name `prep_volume` — it can ask the harness.
 """
 

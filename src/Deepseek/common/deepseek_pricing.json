@@ -1,19 +1,27 @@
 {
   "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "verified": "2026-11-16",
   "unit": "USD per 1M tokens",
-  "peak_utc_windows": [],
+  "peak_utc_windows": [[1, 4], [6, 10]],
+  "peak_utc_weekdays": [1, 2, 3, 4, 5],
+  "peak_note": "Peak: 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday. Chinese public holidays are off-peak all day; they are not modelled here, so an estimate made on one reads high rather than low.",
   "model_display_names": {
-    "deepseek-v4-flash": "DeepSeek-V4-Flash-0731",
+    "deepseek-flash": "DeepSeek-V4.1-Flash-1017",
+    "deepseek-v4-flash": "DeepSeek-V4.1-Flash-1017 (legacy id)",
     "deepseek-v4-pro": "DeepSeek-V4-Pro-0813"
   },
   "models": {
+    "deepseek-flash": {
+      "off_peak": {"cache_hit": 0.003, "cache_miss": 0.15, "output": 0.6},
+      "peak": {"cache_hit": 0.006, "cache_miss": 0.3, "output": 1.2}
+    },
     "deepseek-v4-flash": {
-      "off_peak": {"cache_hit": 0.0028, "cache_miss": 0.14, "output": 0.28},
-      "peak": {"cache_hit": 0.0028, "cache_miss": 0.14, "output": 0.28}
+      "off_peak": {"cache_hit": 0.003, "cache_miss": 0.15, "output": 0.6},
+      "peak": {"cache_hit": 0.006, "cache_miss": 0.3, "output": 1.2}
     },
     "deepseek-v4-pro": {
-      "off_peak": {"cache_hit": 0.003625, "cache_miss": 0.435, "output": 0.87},
-      "peak": {"cache_hit": 0.003625, "cache_miss": 0.435, "output": 0.87}
+      "off_peak": {"cache_hit": 0.022, "cache_miss": 0.66, "output": 1.98},
+      "peak": {"cache_hit": 0.044, "cache_miss": 1.32, "output": 3.96}
     }
   }
 }

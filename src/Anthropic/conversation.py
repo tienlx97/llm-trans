@@ -8,8 +8,10 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from src.Deepseek.common.config import cfg_int
 from src.Anthropic.response import normalize_anthropic_content, sanitize_replayable_block
 from src.Deepseek.common.atomic_io import atomic_write_json
+from src.Deepseek.common.token_estimate import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -111,8 +113,8 @@ class AnthropicConversationManager:
         self.verbatim_ceiling_ratio = 0.60 if raw_ceiling_ratio is None else float(raw_ceiling_ratio)
         # How much of a folded chapter survives, from its opening and from its
         # ending. The tail is the half that matters to the chapter after it.
-        self.summary_head_chars = max(0, int(config.get("summary_head_chars", 240) or 240))
-        self.summary_tail_chars = max(0, int(config.get("summary_tail_chars", 480) or 480))
+        self.summary_head_chars = max(0, cfg_int(config, "summary_head_chars", 240))
+        self.summary_tail_chars = max(0, cfg_int(config, "summary_tail_chars", 480))
         raw_path = Path(str(config.get("persistence_file", ".context/anthropic_conversation.json")))
         self.state_path = raw_path if raw_path.is_absolute() else self.work_dir / raw_path
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,7 +216,7 @@ class AnthropicConversationManager:
 
     def estimated_tokens(self, messages: Any = None) -> int:
         serialized = json.dumps(self._all_replay_messages() if messages is None else messages, ensure_ascii=False)
-        return max(1, len(serialized) // 4)
+        return estimate_tokens(serialized)
 
     def build_messages(
         self,

@@ -7,6 +7,9 @@ type Rates = Readonly<{ cache_hit: number; cache_miss: number; output: number }>
 type PricingDocument = Readonly<{
   source: string;
   peak_utc_windows: readonly (readonly [number, number])[];
+  // ISO weekdays (Mon=1 .. Sun=7) the peak windows apply on; absent = every day.
+  peak_utc_weekdays?: readonly number[];
+  peak_note?: string;
   model_display_names: Readonly<Record<string, string>>;
   models: Readonly<Record<string, Readonly<Record<PricingPeriod, Rates>>>>;
 }>;
@@ -18,6 +21,7 @@ export type DeepSeekPricingStatus = Readonly<{
   utcTime: string;
   modelDisplayNames: Readonly<Record<string, string>>;
   ratesByModel: Readonly<Record<string, Rates>>;
+  peakNote: string | null;
   source: string;
 }>;
 
@@ -48,8 +52,11 @@ function utcTime(clock: Date): string {
 }
 
 export function deepseekPricingStatusAt(clock: Date = new Date()): DeepSeekPricingStatus {
+  // Mirrors deepseek_pricing_status() in src/Deepseek/common/token_telemetry.py.
   const hour = clock.getUTCHours();
-  const period: PricingPeriod = pricing.peak_utc_windows.some(([start, end]) => start <= hour && hour < end) ? 'peak' : 'off_peak';
+  const isoWeekday = clock.getUTCDay() || 7;
+  const peakDay = pricing.peak_utc_weekdays ? pricing.peak_utc_weekdays.includes(isoWeekday) : true;
+  const period: PricingPeriod = peakDay && pricing.peak_utc_windows.some(([start, end]) => start <= hour && hour < end) ? 'peak' : 'off_peak';
   const ratesByModel = Object.fromEntries(Object.entries(pricing.models).map(([model, periods]) => [model, periods[period]]));
   return {
     period,
@@ -58,10 +65,7 @@ export function deepseekPricingStatusAt(clock: Date = new Date()): DeepSeekPrici
     utcTime: utcTime(clock),
     modelDisplayNames: pricing.model_display_names,
     ratesByModel,
+    peakNote: pricing.peak_note ?? null,
     source: pricing.source,
   };
-}
-
-export function usdPerMillion(value: number): string {
-  return `$${value.toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}`;
 }

@@ -10,9 +10,8 @@ already returns, Phase 2.5 hooks, glossary/term-lock enforcement (trust the
 prompt), schema extraction, volume context aggregation, and title
 translation.
 
-Sequential chapter loop only — no parallel coordination. CCT
-(deepseek_optimization.translate_chapters_concurrent) is kept in the
-codebase but not wired in here; call it directly if you want it.
+Sequential chapter loop only — no parallel coordination: the DeepSeek
+conversation is ordered and append-only.
 """
 
 from __future__ import annotations
@@ -24,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.Deepseek.common.chapter_order import in_reading_order
+from src.Deepseek.common.config import cfg_int
 from src.Deepseek.common.atomic_io import atomic_write_json, atomic_write_text
 from src.Deepseek.common.chapter_signals import build_chapter_signal_guidance, parse_chapter_signals
 from src.Deepseek.common.config import WORK_DIR, get_target_language
@@ -104,7 +105,7 @@ class DeepSeekTranslator:
         continuation_cfg = get_continuation_config()
         self.continuation_enabled = bool(continuation_cfg.get("enabled", True))
         self.max_output_continuations = max(
-            0, int(continuation_cfg.get("max_continuations", 3) or 3)
+            0, cfg_int(continuation_cfg, "max_continuations", 3)
         )
 
         thinking_log_cfg = get_thinking_log_config()
@@ -440,7 +441,7 @@ class DeepSeekTranslator:
             # status`, the TUI's phase strip all trust translation_status).
             return self.work_dir / "DRY_RUN"
         output_path = self._default_output_path(chapter_id)
-        output_path.write_text(en_text, encoding="utf-8")
+        atomic_write_text(output_path, en_text)
         _update_manifest_after_translation(self.work_dir, {chapter_id})
         return output_path
 
@@ -451,7 +452,7 @@ class DeepSeekTranslator:
         immediately, and returns {chapter_id: output_path}.
         """
         results: Dict[str, Path] = {}
-        for chapter_path in sorted(chapter_files):
+        for chapter_path in in_reading_order(chapter_files):
             chapter_id = chapter_path.stem
             logger.info("[TRANSLATE] %s — starting", chapter_id)
             output_path = self.translate_and_persist_chapter(chapter_path, {"chapter_id": chapter_id})
@@ -567,7 +568,7 @@ def translate_volume(
     if not jp_dir.is_dir():
         raise FileNotFoundError(f"No JP/ directory for volume {volume_id!r} at {jp_dir}")
 
-    chapter_files = sorted(jp_dir.glob("CHAPTER_*.md"))
+    chapter_files = in_reading_order(jp_dir.glob("CHAPTER_*.md"))
     if chapters:
         wanted = set(chapters)
         chapter_files = [f for f in chapter_files if f.stem in wanted or f.stem.split("_")[-1] in wanted]

@@ -471,7 +471,7 @@ def render_density_html(volume_id: str, results: List[ChapterDensity], blocks_pr
     Length and canon-graph breadth per chapter's silent reasoning (INTERNAL_REASONING,
     master_prompt_deepseek_en.xml). Detected by keyword/regex against real THINKING/*.md
     output, not the prompt's aspirational [TAG] format — the model doesn't reliably emit
-    that; see the module docstring in src/translator/thinking_density.py.
+    that; see the module docstring in src/Deepseek/translator/thinking_density.py.
   </p>
 
   <div class="stat-row">{stat_tiles}</div>

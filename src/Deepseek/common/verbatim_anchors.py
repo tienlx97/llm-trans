@@ -39,6 +39,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
+from src.Deepseek.common.chapter_order import in_reading_order
+
 # An English surface longer than this is a title or a descriptive gloss
 # ("a chill, fluffy board-game café romcom"), not a lexeme a translator
 # repeats verbatim. Reconciling those produces noise, so they are carried as
@@ -326,7 +328,7 @@ def observe_prior_usage(
     """
     observations: List[AnchorObservation] = []
     try:
-        chapter_files = sorted(Path(en_dir).glob("*_EN.md"))
+        chapter_files = in_reading_order(Path(en_dir).glob("*_EN.md"))
     except OSError:
         chapter_files = []
 

@@ -132,17 +132,17 @@ def _resolve_font(font_path: str) -> Path:
     """
     Confirm a usable font.
 
-    This cannot be defaulted: there are no font files anywhere in this
-    repository (get_fonts_to_embed() in config.py names four Google Sans faces
-    that do not exist on disk), and the converter will not rasterize without
-    one. Prefer a HINTED face -- Roboto, Tahoma, Verdana. Hinting is what keeps
+    This is not defaulted: the converter will not rasterize without a font,
+    and the choice matters. Prefer a HINTED face -- Roboto, Tahoma, Verdana
+    (the Literata/Inter files under fonts/ are subset for Vietnamese EPUB
+    embedding, not picked for 1-bit rendering). Hinting is what keeps
     text legible once it is dithered to one bit; an unhinted face that looks
     elegant at 300 PPI turns to mush at 219.
     """
     if not font_path:
         raise XtcPreconditionError(
             "builder.xtc.font_path is not set. XTC rendering rasterizes text, "
-            "so a TTF/OTF is required, and this repository ships none. Use a "
+            "so a TTF/OTF is required. Use a "
             "hinted face (Roboto, Tahoma, Verdana) - hinting is what survives "
             "1-bit dithering."
         )

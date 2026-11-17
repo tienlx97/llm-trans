@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from src.CLI.runner import CliError, CliQuotaError, CliResult, CliRunner, cli_settings
 from src.Deepseek.common.atomic_io import atomic_write_text
+from src.Deepseek.common.chapter_order import reading_order
 from src.Deepseek.common.chapter_signals import build_chapter_signal_guidance, parse_chapter_signals
 from src.Deepseek.common.config import WORK_DIR
 from src.Deepseek.common.language import (
@@ -65,12 +66,6 @@ _FENCE_RE = re.compile(r"^\s*```[a-zA-Z]*\s*\n(.*?)\n\s*```\s*$", re.DOTALL)
 # source; an answer below this fraction of its source lost text.
 _MIN_OUTPUT_RATIO = 0.4
 _RATIO_MIN_SOURCE_CHARS = 400
-
-
-def reading_order(path: Path):
-    """CHAPTER_9 < CHAPTER_10 < CHAPTER_100 (the Librarian pads to two digits,
-    so plain string order breaks past 99 chapters)."""
-    return [int(part) if part.isdigit() else part for part in re.split(r"(\d+)", path.stem)]
 
 
 def split_source(text: str, max_chars: int) -> List[str]:

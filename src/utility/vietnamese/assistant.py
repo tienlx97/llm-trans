@@ -179,13 +179,17 @@ def make_assistant(work_dir: Path, *, dry_run: bool = False, provider: Optional[
     from src.Deepseek.common.config import get_config_section
 
     cfg = get_config_section("assistant") or {}
-    chosen = str(provider or cfg.get("provider") or "openai").strip().lower()
-    chosen_model = model or cfg.get("model") or (get_config_section("translation").get(chosen) or {}).get("model")
+    configured = str(cfg.get("provider") or "openai").strip().lower()
+    chosen = str(provider or configured).strip().lower()
+    # assistant.model belongs to assistant.provider: a --provider override must
+    # not send (say) an OpenAI model id to Gemini or to a CLI.
+    cfg_model = cfg.get("model") if chosen == configured else None
+    chosen_model = model or cfg_model or (get_config_section("translation").get(chosen) or {}).get("model")
     if chosen in ("codex", "claude"):
         from src.CLI.runner import cli_settings
 
         # A CLI may run its own default model; "" means "let the CLI pick".
-        chosen_model = model or cfg.get("model") or cli_settings(chosen).get("model") or ""
+        chosen_model = model or cfg_model or cli_settings(chosen).get("model") or ""
     elif not chosen_model:
         raise AssistantError(f"No model configured for assistant provider {chosen!r}")
     return ProviderAssistant(

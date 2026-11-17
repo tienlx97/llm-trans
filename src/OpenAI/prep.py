@@ -226,14 +226,21 @@ def _log_response_usage(volume_id: str, block_name: str, model: str, response: A
     from src.Deepseek.common.token_telemetry import log_call
 
     stats = _response_stats(response)
+    usage = getattr(response, "usage", None)
+    # The response already carries its cost at the right rates (cache writes,
+    # and the 50% Batch rate when it came from a batch). Without provider= the
+    # row was labelled "deepseek" and the run header showed DeepSeek's tariff.
     log_call(
         phase="prep",
         volume_id=volume_id,
         call_label=f"openai_prep_{block_name}",
         model=model,
         cache_hit_tokens=stats["cache_hit_tokens"],
+        cache_write_tokens=int(getattr(usage, "cache_write_tokens", 0) or 0) if usage is not None else 0,
         fresh_tokens=stats["cache_miss_tokens"],
         output_tokens=stats["output_tokens"],
+        cost_usd=getattr(response, "total_cost_usd", None),
+        provider="openai",
     )
 
 
@@ -676,7 +683,7 @@ def run_openai_prep(
         )
 
     batch_state = str(_state_path(work_dir, batch_cfg)) if use_batch else ""
-    return _assemble_and_finalize(
+    receipt = _assemble_and_finalize(
         work_dir,
         existing_context_xml,
         chapters,
@@ -695,3 +702,14 @@ def run_openai_prep(
             "calls": cache_log,
         },
     )
+    # context.xml is written, so nothing is left to resume. Kept, the block
+    # artifacts and the batch ledger (whose finished jobs stay "recoverable")
+    # would be silently reused by the next prep of this volume -- e.g. after a
+    # web re-import added chapters -- so it would never see the new chapters.
+    # The multi-turn DeepSeek path already clears its artifacts the same way.
+    import shutil
+
+    shutil.rmtree(_artifacts_dir(work_dir), ignore_errors=True)
+    if use_batch:
+        _state_path(work_dir, batch_cfg).unlink(missing_ok=True)
+    return receipt

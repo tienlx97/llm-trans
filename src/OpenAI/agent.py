@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.Deepseek.common.chapter_order import in_reading_order, preceding_chapter_id
+from src.Deepseek.common.config import cfg_int
 from src.Deepseek.common.atomic_io import atomic_write_json, atomic_write_text
 from src.Deepseek.common.config import WORK_DIR, get_safety_fallback_config
 from src.Deepseek.common.language import (
@@ -111,7 +113,7 @@ class OpenAITranslator:
         # on the primary Batch route. Initialise this before any chapter
         # prompt is assembled; fallback activation reuses the same setting.
         self._previous_tail_chars = max(
-            0, int(conversation_cfg.get("previous_chapter_tail_chars", 1200) or 1200)
+            0, cfg_int(conversation_cfg, "previous_chapter_tail_chars", 1200)
         )
         from src.Deepseek.translator.context_manager import load_context_xml
 
@@ -134,7 +136,7 @@ class OpenAITranslator:
         self._previous_guidance_text: Optional[str] = None
         continuation = get_openai_continuation_config(self._active_config)
         self.continuation_enabled = bool(continuation.get("enabled", True))
-        self.max_continuations = max(0, int(continuation.get("max_continuations", 3) or 3))
+        self.max_continuations = max(0, cfg_int(continuation, "max_continuations", 3))
         reasoning_cfg = self._active_config.get("reasoning", {}) or {}
         self._chapter_signals_enabled = bool(
             (self._active_config.get("chapter_signals", {}) or {}).get("enabled", True)
@@ -373,7 +375,7 @@ class OpenAITranslator:
                 conversation_config=conversation_cfg,
             )
         self._previous_tail_chars = max(
-            0, int(conversation_cfg.get("previous_chapter_tail_chars", 1200) or 1200)
+            0, cfg_int(conversation_cfg, "previous_chapter_tail_chars", 1200)
         )
         self.system_instruction = build_system_instruction(
             prompt_path=resolve_master_prompt("openai", get_openai_prompt_path(fallback_config), self.target_language),
@@ -382,7 +384,7 @@ class OpenAITranslator:
         )
         continuation = get_openai_continuation_config(self._active_config)
         self.continuation_enabled = bool(continuation.get("enabled", True))
-        self.max_continuations = max(0, int(continuation.get("max_continuations", 3) or 3))
+        self.max_continuations = max(0, cfg_int(continuation, "max_continuations", 3))
         reasoning_cfg = self._active_config.get("reasoning", {}) or {}
         self._chapter_signals_enabled = bool(
             (self._active_config.get("chapter_signals", {}) or {}).get("enabled", True)
@@ -478,12 +480,7 @@ class OpenAITranslator:
         )
 
     def _preceding_chapter_id(self, chapter_id: str) -> Optional[str]:
-        match = re.match(r"^(.*?)(\d+)$", str(chapter_id))
-        if match is None:
-            return None
-        prefix, digits = match.group(1), match.group(2)
-        index = int(digits)
-        return None if index <= 1 else "%s%0*d" % (prefix, len(digits), index - 1)
+        return preceding_chapter_id(chapter_id)
 
     def _chapter_tail_from_disk(self, chapter_id: str) -> str:
         if self._previous_tail_chars <= 0:
@@ -587,7 +584,7 @@ class OpenAITranslator:
             submit_batch,
         )
 
-        pending = sorted(Path(path) for path in chapter_files)
+        pending = in_reading_order(Path(path) for path in chapter_files)
         if not pending:
             return {}
         batch_cfg = self.batch_config
@@ -696,9 +693,11 @@ class OpenAITranslator:
                 normalized = classify_exception(exc)
                 if self._should_fallback(normalized):
                     self._activate_fallback(str(normalized))
+                    # `pending` still holds this wave's chapters (unless it is
+                    # the seed wave), so de-duplicate or they translate twice.
                     remaining = [
                         path
-                        for path in [*wave, *pending]
+                        for path in dict.fromkeys([*wave, *pending])
                         if path.stem not in written
                     ]
                     return {
@@ -760,9 +759,11 @@ class OpenAITranslator:
                 fallback_error = OpenAIAPIError(reason, code="model_not_found")
                 if self._should_fallback(fallback_error):
                     self._activate_fallback(reason)
+                    # `pending` still holds this wave's chapters (unless it is
+                    # the seed wave), so de-duplicate or they translate twice.
                     remaining = [
                         path
-                        for path in [*wave, *pending]
+                        for path in dict.fromkeys([*wave, *pending])
                         if path.stem not in written
                     ]
                     written.update(self.translate_all(remaining))
@@ -788,7 +789,7 @@ class OpenAITranslator:
         poll_seconds: int,
         deadline_seconds: float,
     ) -> set[str]:
-        from src.OpenAI.batch import batch_is_terminal, poll_batch, retrieve_batch_results
+        from src.OpenAI.batch import retrieve_batch_results
 
         settled: set[str] = set()
         for entry in ledger.recoverable_batches():
@@ -883,7 +884,10 @@ class OpenAITranslator:
                 unfinished[chapter_id] = "max_output — truncated, not persisted"
                 continue
             text, leaked_blocks = split_thinking_from_output(response.content)
-            text = _CJK_LEAK_RE.sub("", text)
+            # Same rule as the synchronous path: only English output is
+            # stripped; another language keeps stray Japanese for QC to report.
+            if self.target_language == DEFAULT_LANGUAGE:
+                text = _CJK_LEAK_RE.sub("", text)
             if not text.strip():
                 unfinished[chapter_id] = "no visible translation text"
                 continue
@@ -917,7 +921,7 @@ class OpenAITranslator:
     def _write_chapter(self, chapter_id: str, text: str) -> Path:
         output_path = self._output_path(chapter_id)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text, encoding="utf-8")
+        atomic_write_text(output_path, text)
         return output_path
 
     def _await_batch(
@@ -1065,7 +1069,7 @@ class OpenAITranslator:
             return self.work_dir / "DRY_RUN"
         output_path = self._output_path(chapter_id)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text, encoding="utf-8")
+        atomic_write_text(output_path, text)
         if self._last_truncated and self.target_language != DEFAULT_LANGUAGE:
             logger.error(
                 "[OPENAI] %s: output truncated; written to %s but NOT marked completed (rerun resumes it)",
@@ -1081,7 +1085,7 @@ class OpenAITranslator:
     def translate_all(self, chapter_files: List[Path]) -> Dict[str, Path]:
         return {
             path.stem: self.translate_and_persist_chapter(path, {"chapter_id": path.stem})
-            for path in sorted(chapter_files)
+            for path in in_reading_order(chapter_files)
         }
 
 
@@ -1144,7 +1148,7 @@ def translate_volume(
     jp_dir = work_dir / "JP"
     if not jp_dir.is_dir():
         raise FileNotFoundError(f"No JP/ directory for volume {volume_id!r} at {jp_dir}")
-    chapter_files = sorted(jp_dir.glob("CHAPTER_*.md"))
+    chapter_files = in_reading_order(jp_dir.glob("CHAPTER_*.md"))
     if chapters:
         wanted = set(chapters)
         chapter_files = [path for path in chapter_files if path.stem in wanted or path.stem.split("_")[-1] in wanted]

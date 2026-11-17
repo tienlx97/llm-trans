@@ -69,26 +69,6 @@ export const manifestSchema = z.looseObject({
   chapters: z.array(manifestChapterSchema).optional(),
 });
 
-// ── translation_log.json ──────────────────────────────────────────────────
-
-const translationLogQualitySchema = z.looseObject({
-  passed: z.boolean().optional(),
-  ai_ism_count: z.number().finite().optional(),
-});
-
-const translationLogChapterSchema = z.looseObject({
-  chapter_id: z.string().optional(),
-  input_tokens: z.number().finite().optional(),
-  output_tokens: z.number().finite().optional(),
-  success: z.boolean().optional(),
-  error: z.string().nullable().optional(),
-  quality: translationLogQualitySchema.optional(),
-});
-
-export const translationLogSchema = z.looseObject({
-  chapters: z.array(translationLogChapterSchema).optional(),
-});
-
 // ── Parse results ─────────────────────────────────────────────────────────
 
 // Every boundary read returns one of these instead of throwing or silently

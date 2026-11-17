@@ -216,7 +216,7 @@ def run_parallel_prep(volume_id: str, series_id: Optional[str] = None) -> Dict[s
     pro_max_tokens = int(prep_cfg.get("max_output_tokens", 128000))
     pro_effort = str(prep_cfg.get("effort", "max"))
 
-    flash_model = str(parallel_cfg.get("flash_model", "deepseek-v4-flash"))
+    flash_model = str(parallel_cfg.get("flash_model", "deepseek-flash"))
     flash_thinking = int(parallel_cfg.get("flash_thinking_budget", 8000))
     flash_max_tokens = int(parallel_cfg.get("flash_max_output_tokens", 32000))
     flash_effort = str(parallel_cfg.get("flash_effort", "max"))

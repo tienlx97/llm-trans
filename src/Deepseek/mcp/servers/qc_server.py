@@ -1,6 +1,6 @@
 """QC phase MCP tools — 1 tool, direct binding to src.utility.qc.agent.run_qc.
 
-Filesystem-only, zero API calls, <5s per volume. See src/qc/agent.py.
+Filesystem-only, zero API calls, <5s per volume. See src/utility/qc/agent.py.
 """
 
 from __future__ import annotations

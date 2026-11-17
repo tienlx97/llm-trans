@@ -27,7 +27,6 @@ def register_librarian_tools(mcp: object, cfg: MCPConfig) -> None:
         volume_id: str = "",
         source_lang: str = "ja",
         target_lang: str = "en",
-        ref_validate: bool = False,
     ) -> dict:
         path = Path(epub_path).expanduser()
         if not path.is_absolute():
@@ -38,8 +37,6 @@ def register_librarian_tools(mcp: object, cfg: MCPConfig) -> None:
         args = [str(path), "--source-lang", source_lang, "--target-lang", target_lang]
         if volume_id:
             args.extend(["--volume-id", volume_id])
-        if ref_validate:
-            args.append("--ref-validate")
         # MCP calls run as a captured subprocess with no keyboard: a re-extraction
         # prompt could never be answered and used to fail the run outright. Always
         # auto-continue into a NEW derived volume directory instead — the old
@@ -184,7 +181,6 @@ def register_librarian_tools(mcp: object, cfg: MCPConfig) -> None:
             volume_id=volume_id,
             source_lang=source_lang,
             target_lang=target_lang,
-            ref_validate=False,
         )
         resolved_volume_id = str(result.get("volume_id", "") or "")
         manifest = {}

@@ -3,10 +3,10 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
-import { manifestSchema, parseBoundary, translationLogSchema } from './boundary.js';
+import { manifestSchema, parseBoundary } from './boundary.js';
 import { asChapterRef, asVolumeId } from './types.js';
 import { resolveVolumeIdentity } from './volumeIdentity.js';
-import type { CapabilitySpec, ChapterLog, ChapterRef, ConfigLine, PhaseStatus, PhaseStatusValue, RunHandle, SortMode, VolumeDetail, VolumeId, VolumeSummary } from './types.js';
+import type { CapabilitySpec, ChapterRef, ConfigLine, PhaseStatus, PhaseStatusValue, RunHandle, SortMode, VolumeDetail, VolumeId, VolumeSummary } from './types.js';
 
 // core/ lives at ts/src/core. The menu package is two levels up;
 // the Python pipeline it operates is its parent, not the menu directory.
@@ -107,8 +107,10 @@ export function loadRuntimeConfigLines(): ConfigLine[] {
     const translationStart = joined.indexOf('\ntranslation:');
     // Every route must be listed: an unmatched provider falls through to the
     // deepseek default and the panel quietly shows the wrong route's settings.
-    const providerMatch = /^\s*provider:\s*(deepseek|qwen|openai|anthropic|gemini)\s*(?:#.*)?$/m.exec(translationStart >= 0 ? joined.slice(translationStart) : joined);
-    const menuKey = `${providerMatch?.[1] ?? 'deepseek'}:`;
+    const providerMatch = /^\s*provider:\s*(deepseek|qwen|openai|anthropic|gemini|codex|claude)\s*(?:#.*)?$/m.exec(translationStart >= 0 ? joined.slice(translationStart) : joined);
+    // codex / claude have no translation.<provider> menu: their settings are the top-level cli: block.
+    const selectedProvider = providerMatch?.[1] ?? 'deepseek';
+    const menuKey = selectedProvider === 'codex' || selectedProvider === 'claude' ? 'cli:' : `${selectedProvider}:`;
     for (const rawLine of lines) {
       const trimmed = rawLine.trim();
       if (!trimmed || trimmed.startsWith('#')) continue;
@@ -145,7 +147,6 @@ export function loadRuntimeConfigLines(): ConfigLine[] {
 const CONFIG_LABELS: Readonly<Record<string, string>> = {
   enabled: 'Status',
   master_prompt: 'Primary translation prompt',
-  master_prompt_v2: 'Continuity translation prompt',
   http_timeout_seconds: 'Request timeout',
   max_output_tokens: 'Maximum output tokens',
   top_p: 'Sampling nucleus',
@@ -165,11 +166,8 @@ const CONFIG_LABELS: Readonly<Record<string, string>> = {
   warn_threshold_prefix_recovery: 'Prefix recovery threshold',
   min_repeat_calls_before_warning: 'Minimum repeat calls',
   thinking_analytics: 'Thinking analytics',
-  concurrent_chapters: 'Concurrent chapters',
-  max_concurrent: 'Maximum concurrent chapters',
   scene_break_formatting: 'Scene-break formatting',
   cjk_cleanup: 'CJK cleanup',
-  salvage_reasoning_leaked_answer: 'Recover leaked reasoning answers',
   max_retries: 'Maximum retries',
   base_delay_ms: 'Retry base delay',
   max_delay_ms: 'Retry maximum delay',
@@ -201,7 +199,7 @@ export function humanizeConfigValue(key: string, value: string): { text: string;
   if (value === 'on') return { text: 'On', boolState: 'on' };
   if (value === 'off') return { text: 'Off', boolState: 'off' };
   if (value === 'deepseek-v4-pro') return { text: 'DeepSeek-V4-Pro-0813', boolState: null };
-  if (value === 'deepseek-v4-flash') return { text: 'DeepSeek-V4-Flash-0731', boolState: null };
+  if (value === 'deepseek-flash' || value === 'deepseek-v4-flash') return { text: 'DeepSeek-V4.1-Flash-1017', boolState: null };
   if (value === 'gpt-6-astra') return { text: 'GPT-6 Astra', boolState: null };
   if (value === 'gpt-6-sol') return { text: 'GPT-6 Sol', boolState: null };
   if (value === 'gpt-6-luna') return { text: 'GPT-6 Luna', boolState: null };
@@ -231,27 +229,16 @@ export function listChapters(volumeId: VolumeId): ChapterRef[] { return listMark
 export function loadVolumeDetail(id: VolumeId): VolumeDetail { return loadVolumeDetailFrom(workRoot, id); }
 
 export function loadVolumeDetailFrom(root: string, id: VolumeId): VolumeDetail {
-  const base = path.join(root, id); const empty: VolumeDetail = { id, loaded: false, jpChapters: 0, enChapters: 0, enWords: 0, qcReports: 0, totalInputTokens: 0, totalOutputTokens: 0, successCount: 0, failCount: 0, aiIsmTotal: 0, lastError: null, logChapters: [] };
+  const base = path.join(root, id); const empty: VolumeDetail = { id, jpChapters: 0, translatedChapters: 0, translatedDir: 'EN', qcReports: 0 };
   if (!existsSync(base)) return empty;
   // The translation folder is per workspace language (EN/, VI/), recorded by the Librarian.
   let translatedDir = 'EN';
   try { const runtime = JSON.parse(readFileSync(path.join(base, 'manifest.json'), 'utf8'))?.runtime_config; if (runtime && typeof runtime.translated_chapters_dir === 'string' && /^[A-Z]{2,3}$/.test(runtime.translated_chapters_dir)) translatedDir = runtime.translated_chapters_dir; } catch { /* no manifest yet: legacy EN layout */ }
-  const jp = listMarkdown(path.join(base, 'JP')); const en = listMarkdown(path.join(base, translatedDir));
-  let enWords = 0; for (const file of en) { try { enWords += readFileSync(file, 'utf8').trim().split(/\s+/).filter(Boolean).length; } catch { /* unreadable artifacts are simply absent from the view */ } }
+  // Counts only: this runs for the Inspector on every volume change, so it must
+  // not read chapter bodies.
+  const jp = listMarkdown(path.join(base, 'JP')); const translated = listMarkdown(path.join(base, translatedDir));
   let qcReports = 0; try { const qc = path.join(base, 'QC'); qcReports = existsSync(qc) ? readdirSync(qc, { withFileTypes: true }).filter((entry) => entry.isFile()).length : 0; } catch { /* no QC yet */ }
-  const logChapters: ChapterLog[] = []; let totalInputTokens = 0; let totalOutputTokens = 0; let successCount = 0; let failCount = 0; let aiIsmTotal = 0; let lastError: string | null = null;
-  try {
-    const logRaw = readFileSync(path.join(base, 'translation_log.json'), 'utf8');
-    const logParsed = parseBoundary(translationLogSchema, logRaw, path.join(base, 'translation_log.json'));
-    // The log is optional (a volume that never translated has none), but a
-    // PRESENT log that fails schema is worth one console line — same
-    // legible-corruption principle as the manifest, quieter because the
-    // detail view has a lastError slot to carry it.
-    if (!logParsed.ok) { lastError = logParsed.error; }
-    const rows = logParsed.ok ? logParsed.data.chapters ?? [] : [];
-    for (const row of rows) { const quality = row.quality ?? {}; const inputTokens = row.input_tokens ?? 0; const outputTokens = row.output_tokens ?? 0; const success = row.success === true; const error = typeof row.error === 'string' ? row.error : null; const aiIsmCount = typeof quality.ai_ism_count === 'number' ? quality.ai_ism_count : null; totalInputTokens += inputTokens; totalOutputTokens += outputTokens; success ? successCount += 1 : failCount += 1; aiIsmTotal += aiIsmCount ?? 0; if (error) lastError = error; logChapters.push({ chapterId: asChapterRef(asString(row.chapter_id, '?')), inputTokens, outputTokens, success, error, passed: typeof quality.passed === 'boolean' ? quality.passed : null, aiIsmCount }); }
-  } catch { /* translation log is optional */ }
-  return { id, loaded: Boolean(jp.length || en.length || qcReports || logChapters.length), jpChapters: jp.length, enChapters: en.length, enWords, qcReports, totalInputTokens, totalOutputTokens, successCount, failCount, aiIsmTotal, lastError, logChapters };
+  return { id, jpChapters: jp.length, translatedChapters: translated.length, translatedDir, qcReports };
 }
 
 export function fuzzyMatch(query: string, target: string): boolean { const q = query.trim().toLowerCase(); if (!q) return true; let index = 0; for (const char of target.toLowerCase()) if (char === q[index]) index += 1; return index === q.length; }

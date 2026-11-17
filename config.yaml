@@ -1,6 +1,7 @@
 # ============================================================================
 # LLM Translator — Master Configuration
-# Lightweight translation client with selectable DeepSeek and Qwen providers.
+# Lightweight translation client. Phase 2 provider is selectable:
+# deepseek | qwen | openai | anthropic | gemini | codex | claude.
 # ============================================================================
 
 # ── Project Identity ────────────────────────────────────────────────────────
@@ -120,16 +121,8 @@ web_import:
   max_retries: 3
   user_agent: "llm-LN-translator/1.0 (personal translation tool; respects robots.txt)"
 
-# ── File System Paths ───────────────────────────────────────────────────────
-paths:
-  input_dir: raw/          # Source EPUBs for extraction
-  work_dir: work/           # Per-volume working directories
-  output_dir: output/       # Final assembled EPUBs
-  prompt_dir: src/Deepseek/prompt/   # Master translation prompts
-  log_dir: logs/            # Debug and cost logs
-
 # ── MCP Phase Routing (optional) ────────────────────────────────────────────
-# Overrides for src/mcp/harness.py's phase-name -> MCP-tool-name map, exposed
+# Overrides for src/Deepseek/mcp/harness.py's phase-name -> MCP-tool-name map, exposed
 # over MCP as the routing://phases resource. Every phase already has a
 # sensible built-in default (see harness.py::DEFAULT_PHASE_ROUTES) — this
 # section only needs entries you actually want to change, e.g. pointing
@@ -258,7 +251,7 @@ prep:
     fallback_to_unified: false         # do not launch a second expensive
                                         # strategy automatically after failure;
                                         # keep artifacts for an explicit retry
-    flash_model: deepseek-v4-flash
+    flash_model: deepseek-flash         # legacy id deepseek-v4-flash is still accepted
     flash_thinking_budget: 32000        # 0 disables extended thinking for
                                         # Flash calls entirely. Must stay
                                         # below flash_max_output_tokens —
@@ -303,7 +296,7 @@ prep:
                                   # (a model/endpoint change resets the prefix) is
                                   # re-run anyway, so later turns can still see it.
                                   # `mtl.py prep --force-rerun` overrides per run.
-    flash_model: deepseek-v4-flash
+    flash_model: deepseek-flash
     thinking_budget: 64000              # 0 disables extended thinking
     effort: max                        # output_config.effort for every turn
     max_output_tokens: 384000            # per-block ceiling — one turn returns
@@ -314,13 +307,13 @@ prep:
       warn_threshold_cache_hit_ratio: 0.70
 
     # Passed straight to DeepSeekConversationManager as its `config`. Prep's
-    # conversation is short (15 turns, one per block) and the full JP text
+    # conversation is short (16 turns, one per block) and the full JP text
     # only enters once (turn 1) — recent_verbatim_chapters is set >= the turn
     # count so the compaction ladder stays dormant for a normal-length volume;
     # it exists as the same safety net the translator relies on, not because
     # a prep run is expected to need it.
     conversation:
-      recent_verbatim_chapters: 15
+      recent_verbatim_chapters: 16
       checkpoint_trigger_ratio: 0.85
       soft_notice_ratio: 0.60
       tool_snip_ratio: 0.70
@@ -332,8 +325,9 @@ prep:
       cache_user_id: true
       context_window: 1000000
 
-  # Per-block reasoning archive for the multi-turn conversation — whichever
-  # block was filled — name choices, canon grounding, schema decisions.
+  # Per-block reasoning archive — read by the OpenAI prep route only (the
+  # DeepSeek prep paths do not write one): name choices, canon grounding,
+  # schema decisions.
   # Already paid for (reasoning tokens bill as output regardless); archiving
   # it per block is a free audit trail for the assembler's validation and
   # LPPM-style review. Mirrors translation.thinking_log.
@@ -347,10 +341,10 @@ translation:
   # ════════════════════════════════════════════════════════════════════════
   # GENERAL — provider route + shared prompt/log settings. These apply to
   # whichever provider is selected; provider-specific knobs live in the
-  # `deepseek:`, `qwen:`, `openai:`, and `anthropic:` menus below.
+  # `deepseek:`, `qwen:`, `openai:`, `anthropic:` and `gemini:` menus below
+  # (codex / claude read the top-level `cli:` block).
   # ════════════════════════════════════════════════════════════════════════
 
-  # Phase 2 provider route: deepseek | qwen | openai | anthropic | gemini.
   provider: anthropic                 # deepseek | qwen | openai | anthropic | gemini | codex | claude
 
   # Master prompt selection. The base prompt consolidates all 13 RAG module
@@ -358,15 +352,8 @@ translation:
   # are needed at runtime.
   #
   # ROUTING: this key feeds the DEEPSEEK route only (get_master_prompt_path()).
-  # When translation.provider is "qwen", the Qwen client loads its own prompt
-  # from translation.qwen.master_prompt below — this key is ignored then, so
-  # do not point it at the Qwen prompt expecting it to ship.
+  # Every other route loads translation.<provider>.master_prompt instead.
   master_prompt: src/Deepseek/prompt/master_prompt_deepseek_en.xml
-
-  # Optional: Use the V2 literacy-anchor variant for sequel volumes that
-  # have prior-volume golden samples in context.xml.  The prompt loader
-  # auto-selects this when context.xml contains <prior_volume_anchors>.
-  master_prompt_v2: src/Deepseek/prompt/master_prompt_deepseek_en_v2.xml
 
   # ── Thinking Log ────────────────────────────────────────────────────────────
   # DeepSeek V4 Pro's reasoning_content shows WHY it made each translation
@@ -384,7 +371,7 @@ translation:
     # Rebuilt after every chapter from every THINKING/*.md file on disk —
     # measures how much of context.xml's canon graph each chapter's silent
     # reasoning actually referenced (which blocks, which characters) against
-    # how long that reasoning ran. See src/translator/thinking_density.py.
+    # how long that reasoning ran. See src/Deepseek/translator/thinking_density.py.
     # Meaningless with thinking_log.enabled: false (nothing to analyze), so
     # this is skipped automatically in that case regardless of this flag.
     density_map:
@@ -397,9 +384,12 @@ translation:
   deepseek:
 
     # ── Model & Connection ──────────────────────────────────────────────────
-    # DeepSeek V4 Pro (~$0.435/$0.87 per MTok input/output, 75% discount).
-    # Switch to deepseek-v4-flash for ~3× cheaper throughput ($0.14/$0.28).
-    model: deepseek-v4-pro              # deepseek-v4-pro | deepseek-v4-flash
+    # Off-peak / peak USD per MTok (peak = 01:00-04:00 and 06:00-10:00 UTC,
+    # Mon-Fri), input cache-miss / output — checked 2026-11-16, see
+    # src/Deepseek/common/deepseek_pricing.json:
+    #   deepseek-v4-pro   $0.66 / $1.98  (peak $1.32 / $3.96)
+    #   deepseek-flash    $0.15 / $0.60  (peak $0.30 / $1.20)
+    model: deepseek-v4-pro              # deepseek-v4-pro | deepseek-flash
 
     # Anthropic-compatible Messages endpoint. DeepSeek's native /anthropic
     # path supports the full Messages API including thinking, streaming,
@@ -574,21 +564,16 @@ translation:
       dovb:
         enabled: true
 
-      # CCT — Concurrent Chapter Translation.
-      # Async chapter processor for parallel translation. NOT wired into
-      # the default sequential flow — this is an opt-in escape hatch for
-      # users who want parallelism despite the conversation-history cost.
-      # DeepSeek conversation is ordered and append-only; concurrent
-      # chapters cannot share conversation state.
-      concurrent_chapters:
-        enabled: true
-        max_concurrent: 3                  # forced to 1 for safety
+    # Streaming is always on for this route; a broken stream gets one
+    # non-streaming attempt before the retry ladder below counts a failure.
 
-    # ── Streaming ───────────────────────────────────────────────────────────
-    streaming:
-      # Stream text_delta and thinking_delta events as they arrive.
-      # When disabled, the client waits for the full response.
-      enabled: true
+    # ── Retry & Resilience ──────────────────────────────────────────────────
+    # Transient failures only (connection, 408/409/429, 5xx, 529 overloaded),
+    # exponential backoff with jitter. 4xx request errors are never retried.
+    retry:
+      max_retries: 3
+      base_delay_ms: 2000
+      max_delay_ms: 60000
 
     # ── Post-Processing ─────────────────────────────────────────────────────
     post_processing:
@@ -598,19 +583,6 @@ translation:
       # Strip CJK artifact characters that leak into EN output (fullwidth
       # parentheses, CJK punctuation, ideographic spaces).
       cjk_cleanup: false
-
-      # Salvage chapters accidentally emitted into reasoning_content
-      # instead of content (known DeepSeek API edge case).
-      salvage_reasoning_leaked_answer: true
-
-    # ── Retry & Resilience ──────────────────────────────────────────────────
-    retry:
-      max_retries: 5
-      base_delay_ms: 500
-      max_delay_ms: 32000
-      jitter_factor: 0.25
-      # 529 Overloaded: don't retry indefinitely. 3 is production value.
-      max_529_retries: 3
 
   # ════════════════════════════════════════════════════════════════════════
   # QWEN ROUTE MENU — read by src/Qwen/config.py when provider: qwen.
@@ -646,7 +618,7 @@ translation:
     caching:
       enabled: true
       explicit: true                 # cache_control markers on system + latest user
-      ttl_minutes: 5                 # official explicit-cache validity window
+                                     # (the provider's explicit-cache window is 5 minutes)
       cache_monitor:
         enabled: true
         warn_threshold_cache_hit_ratio: 0.70
@@ -655,7 +627,6 @@ translation:
     conversation:
       enabled: true
       recent_verbatim_chapters: 2
-      include_exact_jp_task: true
       persistence_file: .context/qwen_conversation.json
       context_window: 1000000
       soft_notice_ratio: 0.60
@@ -815,7 +786,7 @@ translation:
   # (not an Anthropic-compatible passthrough the way DeepSeek/Qwen do).
   #
   # Scoped, deliberately, to the current Claude-5 family that shares one
-  # capability profile end to end: claude-opus-5-5 (default), claude-sonnet-5-5,
+  # capability profile end to end: claude-opus-5-5, claude-sonnet-5-5 (configured below),
   # claude-sonnet-5, claude-opus-5, claude-fable-5-1 — all five adaptive-thinking-only,
   # 1M context, 128K max output, and a hard 400 on any non-default
   # temperature/top_p/top_k regardless of thinking state. Claude Haiku 4.5
@@ -845,7 +816,8 @@ translation:
   #
   # claude-sonnet-5-5 (released 2026-09-28, added here 2026-09-29 ALONGSIDE
   # claude-sonnet-5, not in place of it): same $2/$10 per MTok and tokenizer
-  # as claude-sonnet-5. Thinking still turns off, but "disabled" itself is
+  # as claude-sonnet-5 (cache reads $0.10, half of sonnet-5's $0.20). Thinking
+  # still turns off, but "disabled" itself is
   # now a 400 — the replacement is thinking:{type:"between_tools"}, which
   # only accepts effort low/medium/high (xhigh/max 400s). Its Advisor Mode
   # compatibility is narrower than claude-sonnet-5's AND mandatorily
@@ -858,7 +830,7 @@ translation:
     # Wire id, not the display name: Anthropic model ids never contain a dot.
     # "claude-fable-5.1" is a hard 404 at request time; the client normalises
     # it, but write the real id here.
-    # claude-opus-5-5 is the default. Anthropic's advisor-tool compatibility
+    # claude-opus-5-5 is the code default when `model` is unset. Anthropic's advisor-tool compatibility
     # table still documents no advisor for it (checked 2026-09-23), but the
     # Opus 5.5 -> Opus 5.5 pairing was confirmed working by live use on
     # 2026-09-24, so client.py admits exactly that pairing (and no other
@@ -878,7 +850,7 @@ translation:
     master_prompt: src/Anthropic/prompts/master_prompt_anthropic_en.md
 
     generation:
-      # Uniform across all four supported models: 128K is the shared
+      # Uniform across all five supported models: 128K is the shared
       # max-output ceiling. Keep it at the maximum on claude-opus-5-5 in
       # particular: thinking counts toward max_tokens even when not returned,
       # and Opus 5.5 thinks more per turn than Opus 5 at the same effort.
@@ -1035,8 +1007,8 @@ translation:
     # drift, locked-anchor collisions, register calls) in a single consult —
     # not two separate advisor pairings.
     advisor:
-      enabled: true             # ON for the claude-sonnet-5-5 executor with a
-                                  # claude-sonnet-5-5 advisor (listed pairing).
+      enabled: true             # ON for the claude-sonnet-5-5 executor with the
+                                  # claude-opus-5-5 advisor set below (listed pairing).
                                   # Opus 5.5 -> Opus 5.5 was confirmed by live
                                   # use (2026-09-24). First test volume: 3e35fe.
       # The advisor model. Should be on Anthropic's executor/advisor
@@ -1409,10 +1381,10 @@ translation:
     # content-safety refusal, the same way every provider must match
     # translate_volume's call signature — see that module's docstring for
     # the contract new providers are expected to satisfy.
+    # The fallback target is always the DeepSeek route (the one route with no
+    # content-moderation gate of its own) and the injected context.xml block
+    # is always <translation_inheritance>; neither is configurable.
     enabled: true
-    fallback_provider: deepseek            # the only fallback target — DeepSeek is the one
-                                            # route with no content-moderation gate of its own
-    block_name: translation_inheritance    # context.xml block injected on refusal
     # No static marker here on purpose: leaving this unset lets the code
     # build "This run succeeds from <Provider>'s safety refusal..." with the
     # actual source provider's name. Setting a marker string here overrides
@@ -1425,13 +1397,8 @@ translation:
 
 # ── EPUB Builder ────────────────────────────────────────────────────────────
 builder:
-  # Font embedding for CJK glyph coverage in the output EPUB.
-  # Paths relative to LLM Translator/ root.
-  fonts:
-    enabled: true
-    # Add font paths here if you have custom CJK fonts
-    # japanese: fonts/NotoSansJP-Regular.otf
-    # english: fonts/NotoSerif-Regular.otf
+  # Embedded fonts are configured per target language
+  # (project.languages.<lang>.epub_fonts); English EPUBs embed none.
 
   # Target device for the build. Overridable per run with --profile.
   #   passthrough  images copied untouched; reproduces pre-profile output
@@ -1444,9 +1411,9 @@ builder:
   # actually implements. See src/builder/device_profiles.py.
   device_profile: standard
 
-  # Image optimization for cover/kuchie/illustrations.
-  # Consumed by the 'standard' profile; the xteink profiles carry their own
-  # panel-derived values and ignore these.
+  # Image optimization for kuchie/illustrations (covers use a fixed 1600x2400
+  # box). Consumed by the 'standard' profile; the xteink profiles carry their
+  # own panel-derived values and ignore these.
   images:
     max_width_px: 1200
     max_height_px: 1800
@@ -1456,6 +1423,8 @@ builder:
   # stores PRE-RENDERED bitmap pages rather than text. Opt-in and off by
   # default, because the trade is real: a ~400-page volume goes from ~1-2 MB to
   # ~19 MB (xtc) or ~38 MB (xtch), and the reader permanently loses the ability
+  # (NOTE: `enabled` below is advisory only — no code reads it. The export
+  # runs exactly when `--emit-xtc xtc|xtch` / emit_xtc= is passed.)
   # to change font, size or margins. What it buys is the elimination of the
   # 5-10s first-chapter parse, which the device already caches after one open.
   #
@@ -1486,41 +1455,6 @@ builder:
     # over the defaults its own `init` generates). The schema belongs to that
     # tool, not to us, so anything not listed above goes here.
     settings: {}
-
-# ── Logging ─────────────────────────────────────────────────────────────────
-logging:
-  level: INFO                           # DEBUG | INFO | WARNING | ERROR
-  file: logs/llm_translator.log
-  # Log API cost per chapter (input/output/cache tokens → USD)
-  cost_tracking: true
-
-# ── MCP Harness ─────────────────────────────────────────────────────────────
-# The harness is loaded by src/mcp/harness.py and injected as the system
-# identity prefix before every LLM call the MCP server makes (prep, translate).
-mcp_harness:
-  persona:
-    # Central persona file — full port of CLAUDE.md for LLM API consumption.
-    # Loaded at MCP server startup, cached in memory, prepended to every
-    # system instruction built by harness.build_system_instruction().
-    file: .github/PERSONA.md
-    enabled: true              # ← the only knob the user touches
-
-  subagents:
-    prep:
-      enabled: true
-      model: deepseek-v4-flash
-      thinking_budget: 64000
-      effort: xhigh
-      max_output_tokens: 128000
-
-    translator:
-      harness_managed: true   # DeepSeekClient owns its config (translation.deepseek)
-
-    qc:
-      enabled: true            # Agent-managed; evaluator model comes from the host
-
-    bible_writer:
-      enabled: true            # Filesystem-only, no LLM call
 
 # ── QC Gate Configuration ───────────────────────────────────────────────────
 # Translation-evaluator skill uses the active Codex or Claude host model.

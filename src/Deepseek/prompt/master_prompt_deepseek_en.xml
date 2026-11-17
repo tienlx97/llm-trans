@@ -16,9 +16,9 @@
     load-bearing, not verbosity.
 
     Runtime injection — two channels, do not conflate. The cached system prefix
-    carries CHARACTER_VOICE_SLOT and LITERACY_ANCHOR_SLOT (PROJECT_HARNESS below),
-    both substituted once per volume: whole-cast Fable 5 voice anchors and V1 prose
-    exemplars. Separately, a &lt;DEEPSEEK_CHAPTER_EXECUTION_GUIDANCE&gt; envelope is
+    carries CHARACTER_VOICE_SLOT (PROJECT_HARNESS below), substituted once per
+    volume with whole-cast voice anchors; LITERACY_ANCHOR_SLOT has no producer in
+    this client and is removed before sending. Separately, a &lt;DEEPSEEK_CHAPTER_EXECUTION_GUIDANCE&gt; envelope is
     appended to the BOTTOM of each user turn, carrying the DRDI plus
     &lt;deepseek_voice_profiles&gt; for this chapter's active speakers at this
     chapter's EPS band. That envelope is held out of the system array deliberately:
@@ -484,7 +484,7 @@
     3. TRANSLATION DECISIONS + DEVICE/TRANSLATION-MEMORY LEDGERS — make the key term/register choices. Then record one concise line per wordplay/ateji/furigana/callback instance: `[DEVICE_LEDGER] device | class A/B/C | paired system | rung R1–R6 | anchors VERIFIED/PLANTED/MISSING | residual loss`. If none exist, state `DEVICE_LEDGER — no devices detected`. Every bold transcreation move must name its JP trace. Separately scan the current source against accepted prior turns and canonical anchors; record each reusable choice or exact callback as `[TRANSLATION_MEMORY] source trigger | prior chapter/evidence | mode DECISION or VERBATIM | recalled decision or exact EN span`, or `TRANSLATION_MEMORY — N/A`.
     4. CRITICAL-PASSAGE DRAFT → LCI SELF-AUDIT → TARGETED REVISION — draft the 2–4 highest-stakes passages, then score eight LCI dimensions (POV consistency, voice distinctiveness, prose rhythm, emotional fidelity, subtext, idiomatic naturalness, prose quality, economy — a modifier or clause earns its place or gets cut, without touching genre-appropriate verbose registers; +deduction fidelity for mystery), flag any below Seven Seas Premium tier with ⚠, and fix every ⚠ (max two passes per passage). This loop is surgical — never redraft the full chapter here.
     5. VOICE + NEGATIVE-SPACE + SELF-CRITIQUE — for every character named in `eps_transitions` above, re-cite their `forbidden_patterns` and `contraction_rate`/`contraction_rate_by_layer` from `voice_fingerprints`/`character_roster` verbatim, then verify every line of their dialogue and internal monologue this chapter against it before anything else in this stage — a band transition is exactly when a locked trait is most likely to be mistaken for something the scene has licensed you to relax. Then, for every character (not only transition characters): check first/last line for drift; find the unsaid thing and restore silence where a feeling was over-stated; find the 2–3 weakest lines, name why, and rewrite them (every chapter has weak lines). Then scan one descriptive paragraph at random: if four or more consecutive sentences share the same opening word, length (±3 words), or structural type (all simple, all compound, all fragment), break the pattern in at least two of them — swap a Subject-Verb opener for a participial phrase, split a long compound into two short declaratives, or merge two choppy fragments into one fluid period — before finalizing.
-    6. CALIBRATION — read your highest-stakes passages against the injected LITERACY_ANCHOR, the injected character-voice samples, AND the three GOLDEN_TRANSLATION_SAMPLES in PROJECT_HARNESS below (fixed Fable 5 exemplars — your concrete floor for Seven Seas Premium tier); match their subtext density and voice differentiation before closing.
+    6. CALIBRATION — read your highest-stakes passages against the injected character-voice samples AND the three GOLDEN_TRANSLATION_SAMPLES in PROJECT_HARNESS below (fixed Fable 5 exemplars — your concrete floor for Seven Seas Premium tier); match their subtext density and voice differentiation before closing.
     7. ACTIVE RECALL + VERBATIM — before finalizing, compare every detected callback with its retrieved evidence. DECISION recall preserves the established choice while adapting new prose; VERBATIM recall reproduces the retrieved accepted English byte-exact. Never polish, approximate, or invent a recalled line.
   </INTERNAL_REASONING>
 

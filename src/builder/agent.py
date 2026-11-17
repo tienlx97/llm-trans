@@ -580,41 +580,6 @@ class BuilderAgent:
                 return resolved
         return ""
 
-    def _resolve_translated_book_field(
-        self,
-        metadata_translated: dict,
-        target_language: str,
-        field_name: str,
-        jp_fallback: str,
-    ) -> str:
-        """
-        Resolve book-level metadata field (author/publisher/series) with broad fallbacks.
-        """
-        field_key = f"{field_name}_{target_language}"
-        official_localization = metadata_translated.get("official_localization", {})
-        official_value = ""
-        if isinstance(official_localization, dict):
-            official_value = self._coerce_text(
-                official_localization.get(field_key)
-                or official_localization.get(f"{field_name}_en"),
-                "",
-            )
-
-        nested_value = self._extract_localized_field(
-            metadata_translated.get(field_name),
-            target_language,
-            field_name,
-        )
-
-        return self._coerce_text(
-            metadata_translated.get(field_key)
-            or nested_value
-            or metadata_translated.get(f"{field_name}_en")
-            or official_value
-            or jp_fallback,
-            "",
-        )
-
     def build_epub(
         self,
         volume_id: str,
@@ -634,7 +599,7 @@ class BuilderAgent:
             include_header_illustrations: If True, preserve chapter-opening
                 illustration placeholders in chapter XHTML instead of skipping them
             dry_run: Developer flag, the build-side counterpart to Translator's
-                dry_run (src/translator/dry_run.py). Runs every assembly step
+                dry_run (src/Deepseek/translator/dry_run.py). Runs every assembly step
                 (chapters, images, nav, OPF) into the temp build directory as
                 normal, then instead of packaging a .epub and writing OUTPUT/,
                 copies that assembled OEBPS/ tree to
@@ -652,7 +617,6 @@ class BuilderAgent:
         # Auto-detect header illustrations if not explicitly provided
         detected_headers: List[Dict[str, str]] = []
         if not include_header_illustrations:
-            print("\n[DEBUG] Auto-detecting header illustrations...")
             detected_headers = self.detect_header_illustrations(volume_id)
             if detected_headers:
                 include_header_illustrations = True
@@ -671,6 +635,7 @@ class BuilderAgent:
         )
         print(f"{'='*60}\n")
 
+        build_dir: Optional[Path] = None
         try:
             # Step 1: Load and validate manifest
             print("[STEP 1/8] Loading manifest...")
@@ -735,7 +700,6 @@ class BuilderAgent:
 
             # Get title in actual target language
             # Support v3.0, v3.5, v3.6, and v3.7 schemas
-            title_key = f'title_{actual_target_lang}'
             series_data = metadata_jp.get('series', {})
             # v3.7 format: check for title_english/title_japanese directly first
             if isinstance(series_data, dict) and 'title_english' in series_data:
@@ -919,7 +883,7 @@ class BuilderAgent:
                 title_for_filename = book_title or metadata_jp.get('title', volume_id)
                 # Clean filename
                 safe_title = "".join(c for c in title_for_filename if c.isalnum() or c in ' -_').strip()
-                safe_title = safe_title[:50]  # Limit length
+                safe_title = safe_title[:50].strip() or volume_id  # Limit length; never an empty name
                 output_filename = f"{safe_title}{actual_output_suffix}.epub"
 
             output_path = self.output_base / output_filename
@@ -995,6 +959,10 @@ class BuilderAgent:
             print(f"\n[ERROR] Build failed: {e}")
             print("\n[DEBUG] Full traceback:")
             traceback.print_exc()
+            # A failed build used to leave its temp tree (every image copied)
+            # behind on each attempt.
+            if build_dir is not None:
+                shutil.rmtree(build_dir, ignore_errors=True)
             return BuildResult(
                 success=False,
                 output_path=None,
@@ -1140,7 +1108,7 @@ class BuilderAgent:
         Copy the fully-assembled but unpackaged EPUB tree out of the temp
         build directory into a durable, inspectable location — mirrors
         Translator dry-run's WORK/<volume_id>/DRY_RUN/ convention
-        (src/translator/dry_run.py) so both phases' dry-run artifacts live
+        (src/Deepseek/translator/dry_run.py) so both phases' dry-run artifacts live
         in the same place. Run-stamped per invocation since one build_epub()
         call only ever produces one build, unlike Translator's per-chapter
         cache reuse within a run.
@@ -1383,7 +1351,6 @@ class BuilderAgent:
                 placeholder = h.get('placeholder', '')
                 if ch_id and placeholder:
                     header_lookup[ch_id] = placeholder
-        print(f"     [DEBUG] Header lookup: {header_lookup}")
 
         for i, batch in enumerate(chapter_batches):
             primary = batch[0]
@@ -1424,24 +1391,18 @@ class BuilderAgent:
 
             # Use pre-detected header from lookup (auto-detected in build_epub)
             # Fall back to extraction only if no pre-detected headers provided
-            print(f"     [DEBUG] Processing chapter {i+1}: chapter_id={chapter_id}")
-            print(f"     [DEBUG] header_lookup={header_lookup}")
-            print(f"     [DEBUG] include_header_illustrations={include_header_illustrations}")
 
             if header_lookup:
                 header_illustration_placeholder = header_lookup.get(chapter_id, '')
                 header_illustration_active = bool(header_illustration_placeholder)
-                print(f"     [DEBUG] Using header_lookup: placeholder={header_illustration_placeholder}, active={header_illustration_active}")
             else:
                 # Legacy path: extract from content
                 header_illustration_placeholder = None
                 if include_header_illustrations:
                     header_illustration_placeholder = self._extract_chapter_opening_illustration(md_content)
                     header_illustration_active = bool(header_illustration_placeholder)
-                    print(f"     [DEBUG] Legacy extraction: placeholder={header_illustration_placeholder}")
                 else:
                     header_illustration_active = False
-                    print(f"     [DEBUG] No header illustrations")
 
             # Remove illustration placeholder from markdown content if we're using it
             if header_illustration_active and header_illustration_placeholder:
@@ -2189,8 +2150,15 @@ class BuilderAgent:
 
         assets_dir = work_dir / "assets"
 
+        # Source names already emitted. The illustration resolver's filesystem
+        # fallback lists every file in assets/, so a cover that is not literally
+        # named cover.jpg would otherwise be emitted twice and give the OPF two
+        # manifest items with the same href.
+        emitted_sources: set = set()
+
         def _emit(source_path: Path, is_cover: bool = False) -> str:
             """Emit one image under the profile; returns the emitted filename."""
+            emitted_sources.add(source_path.name.lower())
             result = optimize_image_to(
                 source_path, paths.images_dir, self.profile, is_cover=is_cover
             )
@@ -2273,11 +2241,11 @@ class BuilderAgent:
             kuchie_list=kuchie_list,
         )
 
-        # Track copied illustrations to avoid duplicates
-        copied_illustrations = set()
         illust_counter = 0
-        
+
         for illust in illust_list:
+            if str(illust).lower() in emitted_sources:
+                continue
             # v3.7: images are in root assets directory
             # v3.0-3.5: images are in assets/illustrations subdirectory
             illust_path = assets_dir / illust
@@ -2292,8 +2260,6 @@ class BuilderAgent:
                     href=f"Images/{emitted_illust}",
                     media_type=self._get_image_media_type(emitted_illust)
                 ))
-                # Tracked by SOURCE name: this set dedupes the input list.
-                copied_illustrations.add(illust)
 
         # Additional images (titlepage, manga headers, etc.)
         additional_list = assets.get('additional', [])
@@ -3040,7 +3006,7 @@ class BuilderAgent:
         with open(manifest_path, 'r', encoding='utf-8') as f:
             manifest = json.load(f)
 
-        manifest['pipeline_state']['builder'] = {
+        manifest.setdefault('pipeline_state', {})['builder'] = {
             'status': 'completed',
             'timestamp': datetime.now().isoformat(),
             'output_file': output_filename,
@@ -3048,8 +3014,11 @@ class BuilderAgent:
             'images_included': image_count
         }
 
-        with open(manifest_path, 'w', encoding='utf-8') as f:
-            json.dump(manifest, f, indent=2, ensure_ascii=False)
+        # Atomic like every other manifest writer: an interrupted plain write
+        # would truncate manifest.json and lose the whole volume's state.
+        from src.Deepseek.common.atomic_io import atomic_write_json
+
+        atomic_write_json(manifest_path, manifest)
 
 
 def run_builder(

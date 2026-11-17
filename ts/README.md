@@ -9,7 +9,6 @@ than no menu, obviously.
 ```powershell
 npm install
 npm run typecheck
-npm test
 npm start
 ```
 
@@ -36,15 +35,17 @@ its items and `Enter` opens them; `Esc` returns to Dashboard.
 
 ## Routed capabilities
 
-The primary workflows use the canonical CLI and expose every actual option:
+The primary workflows use the canonical CLI. They cover the core EPUB flow;
+`--target`, `--provider`, `import-url`, `resume`, `repair` and `bible-vi`
+are CLI-only for now (`python scripts/mtl.py -h`):
 
 | Workflow | Exact CLI fields |
 |---|---|
 | Extract | EPUB, `--volume-id` |
 | Prep | volume, `--series-id` |
-| Translate | volume, `--chapters` multi-select |
+| Translate | volume, `--chapters` multi-select, `--dry-run` |
 | QC | volume |
-| Build | volume, `--output` |
+| Build | volume, `--output`, `--dry-run`, `--profile`, `--emit-xtc` |
 | Full Pipeline | EPUB, `--volume-id`, `--series-id` |
 
 Advanced Toolbox gets its input shape from MCP `listTools()` and overlays the

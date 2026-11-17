@@ -5,18 +5,13 @@ Language-agnostic configuration for extracting and parsing source EPUBs.
 """
 
 from pathlib import Path
-from typing import Dict, Any, List
-from src.Deepseek.common.config import load_config, INPUT_DIR, WORK_DIR, get_target_language
+from typing import Dict, Any
+from src.Deepseek.common.config import load_config, WORK_DIR, get_target_language
 
 
 # ============================================================================
 # INPUT PROCESSING SETTINGS
 # ============================================================================
-
-def get_input_dir() -> Path:
-    """Get input directory for source EPUBs."""
-    return INPUT_DIR
-
 
 def get_work_dir() -> Path:
     """Get working directory for extracted content."""
@@ -51,9 +46,6 @@ COVER_PATTERNS = [
 # Ruby tag handling (for CJK languages)
 REMOVE_RUBY_TAGS = True
 
-# Vertical text class to remove
-REMOVE_VERTICAL_TEXT_CLASS = True
-
 # Scene break marker (generic)
 SCENE_BREAK_MARKER = "* * *"
 
@@ -70,12 +62,12 @@ def get_volume_structure() -> Dict[str, str]:
     Get the standard volume directory structure.
     
     Uses target_language from config.yaml to determine the translated chapters
-    directory name (e.g., "EN" for English, "VN" for Vietnamese).
+    directory name (e.g., "EN" for English, "VI" for Vietnamese).
 
     Returns:
         Dictionary mapping directory purpose to relative path.
     """
-    target_lang = get_target_language().upper()  # "en" -> "EN", "vn" -> "VN"
+    target_lang = get_target_language().upper()  # "en" -> "EN", "vi" -> "VI"
     
     return {
         "source_chapters": "JP",      # Source language chapters (markdown)
@@ -87,30 +79,6 @@ def get_volume_structure() -> Dict[str, str]:
         "epub_extracted": "_epub_extracted",  # Raw extracted EPUB
     }
 
-
-# ============================================================================
-# CHAPTER FILE PATTERNS
-# ============================================================================
-
-def get_chapter_patterns() -> Dict[str, str]:
-    """
-    Get regex patterns for detecting chapter types.
-
-    Returns:
-        Dictionary mapping chapter type to regex pattern.
-    """
-    return {
-        "prologue": r"(?i)(prologue|プロローグ|序章)",
-        "chapter": r"(?i)(chapter\s*\d+|第\d+章|chương\s*\d+)",
-        "interlude": r"(?i)(interlude|幕間|막간)",
-        "epilogue": r"(?i)(epilogue|エピローグ|終章)",
-        "afterword": r"(?i)(afterword|あとがき|후기)",
-    }
-
-
-# ============================================================================
-# METADATA EXTRACTION
-# ============================================================================
 
 # ============================================================================
 # PRE-TOC CONTENT DETECTION (Unlisted Opening Hooks)

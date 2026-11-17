@@ -419,7 +419,9 @@ def merge_translated_shards_to_spine(
         manifest_path = work_dir / "manifest.json"
         backup_path = context_dir / f"manifest_before_spine_merge_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         backup_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-        manifest_path.write_text(json.dumps(manifest_out, indent=2, ensure_ascii=False), encoding="utf-8")
+        from src.Deepseek.common.atomic_io import atomic_write_json
+
+        atomic_write_json(manifest_path, manifest_out)
 
     diagnostics.update({
         "applied": True,

@@ -19,7 +19,7 @@ __version__ = "1.0.0"
 
 @dataclass(frozen=True)
 class MCPConfig:
-    """Resolved MCP runtime configuration — 3 tool servers, no bible/RAG/chroma."""
+    """Resolved MCP runtime configuration (paths, allowlist, output cap)."""
 
     server_name: str
     version: str
@@ -51,7 +51,7 @@ def _resolved_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
 
 def default_mcp_config() -> MCPConfig:
     """Build default runtime config from src.Deepseek.common.config constants + environment."""
-    prompt_dir = PIPELINE_ROOT / "src" / "prompt"
+    prompt_dir = PIPELINE_ROOT / "src" / "Deepseek" / "prompt"
     config_path = PIPELINE_ROOT / "config.yaml"
     max_output_tokens = int(os.getenv("MAX_MCP_OUTPUT_TOKENS", "25000"))
     allow_writes = _env_bool("MCP_ALLOW_WRITE_WITHOUT_CONFIRMATION", False)

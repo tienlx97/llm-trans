@@ -99,6 +99,23 @@ def get_config_section(section: str) -> Dict[str, Any]:
     return copy.deepcopy(config.get(section, {}))
 
 
+def cfg_int(mapping: Dict[str, Any], key: str, default: int) -> int:
+    """``mapping[key]`` as an int; ``default`` only when the key is absent or null.
+
+    Not ``int(mapping.get(key, default) or default)``: that idiom also swallows
+    an explicit ``0``, which several knobs document as "off"
+    (``previous_chapter_tail_chars: 0``, ``max_retries: 0``).
+    """
+    value = mapping.get(key)
+    return default if value is None else int(value)
+
+
+def cfg_float(mapping: Dict[str, Any], key: str, default: float) -> float:
+    """Float twin of :func:`cfg_int`."""
+    value = mapping.get(key)
+    return default if value is None else float(value)
+
+
 def get_safety_fallback_config() -> Dict[str, Any]:
     """Provider-agnostic ``translation.safety_fallback`` config — the
     Qwen/Anthropic/OpenAI-to-DeepSeek content-refusal fallback. Not scoped
@@ -147,7 +164,7 @@ def ensure_utf8_console(streams: Sequence[str] = ("stdout", "stderr")) -> None:
     or Builder logs. `errors="replace"` is belt-and-suspenders only; UTF-8
     itself covers the full JP text these processes ever print.
 
-    NOT applied automatically at import time. `src/mcp/server.py`'s stdout
+    NOT applied automatically at import time. `src/Deepseek/mcp/server.py`'s stdout
     is a JSON-RPC channel that must never be touched — only entry points
     that print plain human-readable text (scripts/mtl.py, the librarian/
     builder `__main__` subprocess entry points) should call this, and the

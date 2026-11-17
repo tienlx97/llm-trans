@@ -234,10 +234,6 @@ def resolve_chapter_markdown(
     )
 
 
-# resolve_bible_file intentionally dropped — series bibles are out of scope
-# for the lightweight client (see PLANNING.md "No series continuity").
-
-
 def _extract_chapter_number(text: str) -> Optional[int]:
     match = re.search(r"(\d+)", str(text or ""))
     if not match:

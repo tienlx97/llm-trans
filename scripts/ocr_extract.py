@@ -96,7 +96,6 @@ def ocr_with_manga(path: str | Path, pre: bool = True) -> str:
         ocr_with_manga._model = MangaOcr()
         log.info("manga-ocr model ready.")
 
-    img_path = path if not pre else None
     if pre:
         # manga-ocr handles raw scans well; optional pre-process still helps.
         img = preprocess(path)

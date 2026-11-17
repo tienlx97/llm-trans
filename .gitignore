@@ -20,7 +20,6 @@ dsh/
 .codex/
 .grok/
 .dsh/
-.
 
 # ── Foreign nested repositories (never vendor another project's history) ───
 epub-to-xtc-converter/
@@ -62,12 +61,8 @@ dist-ts/
 Thumbs.db
 
 # ── Workspace Artifacts (don't commit actual translation data) ──────────────
-raw/*
-!raw/.gitkeep
 output/*
 !output/.gitkeep
-work/*
-!work/.gitkeep
 logs/*
 !logs/.gitkeep
 cache/*
@@ -89,5 +84,7 @@ work/
 .github/
 /AGENTS.md
 /PLANNING.md
-bible/
-bibles/
+# Root-anchored on purpose: an unanchored `bible/` also swallowed the source
+# package src/utility/bible/, which is why it never reached the remote.
+/bible/
+/bibles/

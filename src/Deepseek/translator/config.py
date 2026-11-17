@@ -63,7 +63,7 @@ def get_conversation_config() -> Dict[str, Any]:
 
 
 def get_optimizations_config() -> Dict[str, Any]:
-    """The `translation.deepseek.optimizations` block (DRDI/DOVB/CCT toggles)."""
+    """The `translation.deepseek.optimizations` block (DRDI/DOVB toggles)."""
     translator_cfg = get_config_section("translation").get("deepseek", {}) or {}
     return translator_cfg.get("optimizations", {}) or {}
 
@@ -72,6 +72,12 @@ def get_post_processing_config() -> Dict[str, Any]:
     """The `translation.deepseek.post_processing` block."""
     translator_cfg = get_config_section("translation").get("deepseek", {}) or {}
     return translator_cfg.get("post_processing", {}) or {}
+
+
+def get_retry_config() -> Dict[str, Any]:
+    """The `translation.deepseek.retry` block (transient-failure backoff)."""
+    translator_cfg = get_config_section("translation").get("deepseek", {}) or {}
+    return translator_cfg.get("retry", {}) or {}
 
 
 def get_continuation_config() -> Dict[str, Any]:

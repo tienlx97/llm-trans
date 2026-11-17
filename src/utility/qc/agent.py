@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Set
 from xml.etree import ElementTree as ET
 
+from src.Deepseek.common.chapter_order import in_reading_order
 from src.Deepseek.common.config import WORK_DIR
 
 # Tries a real tokenizer for the token-sanity check; falls back to a
@@ -131,7 +132,7 @@ def run_qc(volume_id: str, *, llm: bool = False, dry_run: bool = False,
     en_dir = work_dir / "EN"
     context_xml_path = work_dir / "context.xml"
 
-    jp_files = sorted(jp_dir.glob("*.md")) if jp_dir.is_dir() else []
+    jp_files = in_reading_order(jp_dir.glob("*.md")) if jp_dir.is_dir() else []
 
     completeness_missing: List[str] = []
     truncation_flags: List[str] = []

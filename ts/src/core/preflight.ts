@@ -13,6 +13,9 @@ const DEFAULT_API_KEY_ENVS: Readonly<Record<string, string>> = {
   gemini: 'GEMINI_API_KEY',
   anthropic: 'ANTHROPIC_API_KEY',
 };
+// Subscription CLIs (src/CLI): the signed-in Codex CLI / Claude Code. No API
+// key and no provider SDK import are involved.
+const CLI_PROVIDERS: ReadonlySet<string> = new Set(['codex', 'claude']);
 
 export type PreflightRequirements = {
   readonly provider: string;
@@ -25,7 +28,8 @@ export function resolvePreflightRequirements(configText: string): PreflightRequi
   // sits at the same 2-space indent earlier in the file and would otherwise
   // shadow this match, flipping the detected provider and API key.
   const translationSection = configText.slice(Math.max(0, configText.indexOf('\ntranslation:')));
-  const provider = (/^\s{2}provider:\s*(deepseek|qwen|openai|anthropic|gemini)\s*(?:#.*)?$/m.exec(translationSection)?.[1] ?? 'deepseek').toLowerCase();
+  const provider = (/^\s{2}provider:\s*(deepseek|qwen|openai|anthropic|gemini|codex|claude)\s*(?:#.*)?$/m.exec(translationSection)?.[1] ?? 'deepseek').toLowerCase();
+  if (CLI_PROVIDERS.has(provider)) return { provider, apiKeyEnv: '', imports: BASE_IMPORTS };
   const apiKeyEnv = providerApiKeyEnv(configText, provider) ?? DEFAULT_API_KEY_ENVS[provider] ?? 'DEEPSEEK_API_KEY';
   return {
     provider,
@@ -52,6 +56,7 @@ function providerApiKeyEnv(configText: string, provider: string): string | null 
 
 
 function envHasApiKey(apiKeyEnv: string): boolean {
+  if (!apiKeyEnv) return true; // subscription CLI route: nothing to check
   if (Boolean(process.env[apiKeyEnv])) return true;
   const envPath = path.join(pipelineRoot, '.env');
   if (!existsSync(envPath)) return false;

@@ -7,6 +7,7 @@ Now uses PublisherProfileManager for publisher detection.
 
 import os
 import re
+import unicodedata
 import zipfile
 import hashlib
 import shutil
@@ -148,8 +149,12 @@ def extract_opf_metadata(opf_path: Path) -> Dict[str, Any]:
         # publisher_short — strip \u682a\u5f0f\u4f1a\u793e prefix and KADOKAWA-style org suffixes
         pub = result["publisher_jp"]
         short = re.sub(r'^(\u682a\u5f0f\u4f1a\u793e|\u6709\u9650\u4f1a\u793e|\u6709\u9650\u8cac\u4efb\u4f1a\u793e)', '', pub).strip()
-        # Also strip KADOKAWA full-width romanized variants
-        short = re.sub(r'[\uff21-\uff3a\uff41-\uff5a]+', lambda m: m.group(0), short).strip()
+        # Normalise full-width romanised names to ASCII
+        short = re.sub(
+            r'[\uff21-\uff3a\uff41-\uff5a]+',
+            lambda m: unicodedata.normalize('NFKC', m.group(0)),  # full-width KADOKAWA -> ASCII
+            short,
+        ).strip()
         result["publisher_short"] = short or pub
 
         # dc:language
@@ -205,53 +210,54 @@ class EPUBExtractor:
 
     def _check_existing_translations(self, work_dir: Path) -> Optional[dict]:
         """
-        Check if work directory has existing translations.
-        
-        Returns dict with translation info, or None if no translations found.
+        Check whether the work directory holds work that must not be deleted.
+
+        Returns a dict describing it, or None when the directory is safe to
+        replace. The files on disk are the evidence: a missing or corrupt
+        manifest.json must never read as "nothing here", because the caller
+        deletes the directory on None. A finished prep counts too: it is a
+        paid context.xml that a re-extraction would otherwise wipe.
         """
-        manifest_path = work_dir / "manifest.json"
-        
-        if not manifest_path.exists():
-            return None
-        
+        translated_dir_counts: Dict[str, int] = {}
+        translated_total = 0
         try:
-            with open(manifest_path, encoding='utf-8') as f:
+            children = list(work_dir.iterdir())
+        except OSError:
+            children = []
+        for child in children:
+            if not child.is_dir():
+                continue
+            dir_name = child.name.strip().upper()
+            if dir_name.startswith(("JP", "QC", "ASSET", "_", ".")):
+                continue
+            chapter_files = list(child.glob("CHAPTER_*_*.md"))
+            if chapter_files:
+                translated_dir_counts[child.name] = len(chapter_files)
+                translated_total += len(chapter_files)
+
+        translator_status = 'unknown'
+        chapters_completed = 0
+        prep_completed = False
+        try:
+            with open(work_dir / "manifest.json", encoding='utf-8') as f:
                 manifest = json.load(f)
-            
-            # Check for translated chapter files across common target-language folders.
-            # Keep this language-agnostic enough to catch EN/VN and variant dirs like "EN 2".
-            translated_dir_counts: Dict[str, int] = {}
-            translated_total = 0
-            for child in work_dir.iterdir():
-                if not child.is_dir():
-                    continue
-                dir_name = child.name.strip().upper()
-                if dir_name.startswith("JP") or dir_name.startswith("QC") or dir_name.startswith("ASSET"):
-                    continue
-                chapter_files = list(child.glob("CHAPTER_*_*.md"))
-                if chapter_files:
-                    translated_dir_counts[child.name] = len(chapter_files)
-                    translated_total += len(chapter_files)
-            
-            # Check pipeline state
-            pipeline_state = manifest.get('pipeline_state', {})
-            translator = pipeline_state.get('translator', {})
+            pipeline_state = manifest.get('pipeline_state', {}) if isinstance(manifest, dict) else {}
+            translator = pipeline_state.get('translator', {}) or {}
             translator_status = translator.get('status', 'unknown')
-            chapters_completed = translator.get('chapters_completed', 0)
-            
-            # Only warn if there are actual translations
-            if translated_total > 0 or chapters_completed > 0:
-                return {
-                    'translated_total': translated_total,
-                    'translated_dirs': translated_dir_counts,
-                    'translator_status': translator_status,
-                    'chapters_completed': chapters_completed
-                }
-            
-            return None
-            
-        except (json.JSONDecodeError, KeyError):
-            return None
+            chapters_completed = int(translator.get('chapters_completed', 0) or 0)
+            prep_completed = (pipeline_state.get('prep', {}) or {}).get('status') == 'completed'
+        except (OSError, ValueError, AttributeError, TypeError):
+            translator_status = 'manifest unreadable'
+
+        if translated_total > 0 or chapters_completed > 0 or prep_completed:
+            return {
+                'translated_total': translated_total,
+                'translated_dirs': translated_dir_counts,
+                'translator_status': translator_status,
+                'chapters_completed': chapters_completed,
+                'prep_completed': prep_completed,
+            }
+        return None
 
     def extract(self, epub_path: Path, volume_id: Optional[str] = None, force_rerun: bool = False) -> ExtractionResult:
         """
@@ -315,11 +321,11 @@ class EPUBExtractor:
                 print(f"Existing translations: {existing_translations['translated_total']} chapters")
                 print(f"Translation folders: {translated_summary}")
                 print(f"Translation status: {existing_translations['translator_status']}")
-                print("\nRe-extracting will create a NEW directory and LOSE this state.")
-                print("\nRecommended actions:")
-                print("  1. Cancel and use migration script:")
-                print(f"     python scripts/migrate_extraction.py --auto-detect \"{epub_path.stem[:20]}\"")
-                print("  2. Continue anyway (creates new volume ID, old extraction preserved)")
+                if existing_translations.get('prep_completed'):
+                    print("Prep: completed (context.xml is populated)")
+                print("\nRe-extracting creates a NEW volume directory; the existing workspace")
+                print("is kept untouched. To continue the existing volume instead, cancel and run:")
+                print(f"     python scripts/mtl.py resume {volume_id}")
                 print("="*70)
 
                 if force_rerun:
@@ -339,7 +345,7 @@ class EPUBExtractor:
                             content_dir=Path(),
                             opf_path=Path(),
                             success=False,
-                            error="Re-extraction cancelled by user. Use migration script to preserve translations."
+                            error=f"Re-extraction cancelled. Continue the existing volume with: mtl resume {volume_id}"
                         )
 
                 # Data-safety default: preserve old translated workspace by writing into a new volume folder.

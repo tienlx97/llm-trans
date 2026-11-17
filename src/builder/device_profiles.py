@@ -25,7 +25,7 @@ the same registry, so the two can never disagree about how big a screen is.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, FrozenSet, Optional, Tuple
 
 
@@ -136,8 +136,8 @@ PROFILES: Dict[str, DeviceProfile] = {
         stylesheet=STYLESHEET_DEFAULT,
     ),
 
-    # 300 PPI readers - Kindle, Kobo, tablets. Finally implements the values
-    # config.yaml has been declaring to nobody.
+    # 300 PPI readers - Kindle, Kobo, tablets. image_box / jpeg_quality here are
+    # the defaults; resolve_profile() overlays config.yaml's builder.images.
     "standard": DeviceProfile(
         name="standard",
         label="Standard 300 PPI reader",
@@ -226,7 +226,30 @@ def resolve_profile(name: Optional[str] = None) -> DeviceProfile:
             f"Unknown device profile {name!r}. Valid profiles: "
             f"{', '.join(PROFILE_NAMES)}"
         )
+    if key == DEFAULT_PROFILE_NAME:
+        profile = _with_configured_images(profile)
     return profile
+
+
+def _with_configured_images(profile: DeviceProfile) -> DeviceProfile:
+    """Overlay config.yaml's builder.images on the standard profile.
+
+    The xteink profiles derive their box from the panel and ignore it. A
+    missing or malformed config leaves the registry values untouched.
+    """
+    try:
+        from .config import get_image_config
+
+        images = get_image_config()
+        box = (int(images["max_width_px"]), int(images["max_height_px"]))
+        quality = int(images["jpeg_quality"])
+    except Exception:
+        return profile
+    if min(box) < 1 or not 1 <= quality <= 100:
+        return profile
+    if box == profile.image_box and quality == profile.jpeg_quality:
+        return profile
+    return replace(profile, image_box=box, jpeg_quality=quality)
 
 
 def describe_profile(profile: DeviceProfile) -> str:

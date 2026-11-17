@@ -5,7 +5,7 @@ independently-drifting ones.
 
 Three responsibilities live here, and nowhere else:
 
-1. **Pricing** (PRICING_PER_MTOK) — moved from src/translator/deepseek_client.py's
+1. **Pricing** (PRICING_PER_MTOK) — moved from src/Deepseek/translator/deepseek_client.py's
    old _DEEPSEEK_RATES_PER_MTOK / _DEEPSEEK_FLASH_RATES_PER_MTOK module
    constants. That file now delegates estimate_usage_cost_usd() here instead
    of keeping its own copy — one pricing table, not two that can silently
@@ -78,6 +78,12 @@ DEEPSEEK_PRICING_SOURCE = str(_DEEPSEEK_PRICING_DOCUMENT["source"])
 DEEPSEEK_PEAK_UTC_WINDOWS = tuple(
     (int(window[0]), int(window[1])) for window in _DEEPSEEK_PRICING_DOCUMENT["peak_utc_windows"]
 )
+# ISO weekdays (Mon=1 .. Sun=7) on which the peak windows apply. Chinese public
+# holidays are off-peak all day too, but are not modelled: an estimate made on
+# one reads high, never low.
+DEEPSEEK_PEAK_UTC_WEEKDAYS = frozenset(
+    int(day) for day in _DEEPSEEK_PRICING_DOCUMENT.get("peak_utc_weekdays", range(1, 8))
+)
 DEEPSEEK_PRICING_PER_MTOK: Dict[str, Dict[str, Dict[str, float]]] = {
     str(model): {
         str(period): {str(metric): float(rate) for metric, rate in rates.items()}
@@ -128,12 +134,12 @@ PRICING_PER_MTOK: Dict[str, Dict[str, float]] = {
     "claude-sonnet-5":  {"cache_hit": 0.20, "cache_miss": 2.00, "cache_write": 2.50,  "cache_write_1h": 4.00,  "output": 10.00},
     # claude-sonnet-5-5 added 2026-09-29 ALONGSIDE claude-sonnet-5 above, not
     # in place of it -- claude-sonnet-5 stays live as the plaintext Advisor
-    # Mode executor (see client.py::SUPPORTED_MODELS). Every rate below is
-    # byte-identical to the sonnet-5 row: verified 2026-09-29 against
-    # https://platform.claude.com/docs/en/models/sonnet-5-5/overview, which
-    # states outright "Claude Sonnet 5.5 has the same prices as Claude Sonnet
-    # 5" in its own migration guide.
-    "claude-sonnet-5-5":{"cache_hit": 0.20, "cache_miss": 2.00, "cache_write": 2.50,  "cache_write_1h": 4.00,  "output": 10.00},
+    # Mode executor (see client.py::SUPPORTED_MODELS). Same $2/$10 as
+    # claude-sonnet-5 EXCEPT cache reads: $0.10/MTok (0.05x input), half the
+    # sonnet-5 rate -- another per-model cache-read rate that must come from
+    # this row, never be derived. Corrected 2026-11-16 (the row used to copy
+    # sonnet-5's $0.20 and overstated every cached token twofold).
+    "claude-sonnet-5-5":{"cache_hit": 0.10, "cache_miss": 2.00, "cache_write": 2.50,  "cache_write_1h": 4.00,  "output": 10.00},
     "claude-opus-5":    {"cache_hit": 0.50, "cache_miss": 5.00, "cache_write": 6.25,  "cache_write_1h": 10.00, "output": 25.00},
     "claude-fable-5-1": {"cache_hit": 0.25, "cache_miss": 10.00, "cache_write": 12.50, "cache_write_1h": 20.00, "output": 50.00},
     # claude-opus-5-5 verified 2026-09-23 against
@@ -230,7 +236,11 @@ def deepseek_pricing_status(now: Optional[datetime] = None) -> Dict[str, Any]:
         local_now = local_now.astimezone()
     utc_now = local_now.astimezone(timezone.utc)
     has_peak_windows = bool(DEEPSEEK_PEAK_UTC_WINDOWS)
-    is_peak = has_peak_windows and any(start <= utc_now.hour < end for start, end in DEEPSEEK_PEAK_UTC_WINDOWS)
+    is_peak = (
+        has_peak_windows
+        and utc_now.isoweekday() in DEEPSEEK_PEAK_UTC_WEEKDAYS
+        and any(start <= utc_now.hour < end for start, end in DEEPSEEK_PEAK_UTC_WINDOWS)
+    )
     period = "peak" if is_peak else "off_peak"
     return {
         "period": period,
@@ -346,7 +356,9 @@ def _rates_for_model(
             column: max(PRICING_PER_MTOK[model][column] for model in _ANTHROPIC_MODELS)
             for column in ("cache_hit", "cache_miss", "cache_write", "output")
         }
-    model = "deepseek-v4-flash" if "flash" in name else "deepseek-v4-pro"
+    # "deepseek-flash" is the current id; the legacy "deepseek-v4-flash" is
+    # still accepted by the API and billed at the same Flash price.
+    model = "deepseek-flash" if "flash" in name else "deepseek-v4-pro"
     return DEEPSEEK_PRICING_PER_MTOK[model][deepseek_pricing_status(pricing_at)["period"]]
 
 
@@ -365,7 +377,7 @@ def cost_breakdown_usd(
     batch: bool = False,
     **_ignored: Any,
 ) -> Dict[str, Any]:
-    """Full cost breakdown dict — same shape src/translator/deepseek_client.py's
+    """Full cost breakdown dict — same shape src/Deepseek/translator/deepseek_client.py's
     estimate_usage_cost_usd() has always returned, so that method can delegate
     here without changing its contract for existing callers.
 

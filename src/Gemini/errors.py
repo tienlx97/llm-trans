@@ -124,7 +124,9 @@ def call_with_retry(
     while True:
         try:
             return fn()
-        except BaseException as exc:  # retry policy works on provider-normalized exceptions
+        # Exception, not BaseException: Ctrl+C (KeyboardInterrupt) and SystemExit
+        # must abort the run, not be classified as a transport error and retried.
+        except Exception as exc:  # retry policy works on provider-normalized exceptions
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             normalized = classify_exception(exc)

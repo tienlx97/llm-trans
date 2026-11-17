@@ -42,7 +42,7 @@ for you) so the `src.` import prefix resolves.
     status <vol_id>          Pipeline state + chapter completion summary
 
 Bible writing for the ENGLISH series bible (cross-volume continuity) stays
-MCP/IDE-agent-only — see .github/skills/deepseek-translator/SKILL.md.
+MCP-only (the `write_bible` tool).
 """
 
 import argparse
@@ -87,41 +87,16 @@ from src.builder.device_profiles import PROFILE_NAMES
 from src.utility.prep.agent import PrepError, run_prep
 from src.utility.qc.agent import run_qc
 
-PROVIDERS = ("deepseek", "qwen", "openai", "anthropic", "gemini", "codex", "claude")
+# The provider table lives in one place; codex / claude drive the signed-in
+# Codex CLI / Claude Code (subscription billing, no API key); see src/CLI/.
+from src.Deepseek.translator.provider import (
+    CLI_PROVIDERS,
+    PROVIDERS,
+    configured_provider as _configured_provider,
+    get_volume_translator as _resolve_translate_volume,
+)
+
 PREP_PROVIDERS = ("deepseek", "openai", "codex", "claude")
-# codex / claude drive the signed-in Codex CLI / Claude Code (subscription
-# billing, no API key); see src/CLI/.
-CLI_PROVIDERS = ("codex", "claude")
-
-
-def _configured_provider(override: str | None = None) -> str:
-    return str(override or get_config_section("translation").get("provider", "deepseek")).strip().lower()
-
-
-def _resolve_translate_volume(provider: str | None = None):
-    """Import ``translate_volume`` for the configured (or overridden) Phase 2 provider."""
-    provider = _configured_provider(provider)
-    if provider == "qwen":
-        from src.Qwen.agent import translate_volume as _tv
-    elif provider == "openai":
-        from src.OpenAI.agent import translate_volume as _tv
-    elif provider == "anthropic":
-        from src.Anthropic.agent import translate_volume as _tv
-    elif provider == "gemini":
-        from src.Gemini.agent import translate_volume as _tv
-    elif provider == "deepseek":
-        from src.Deepseek.translator.agent import translate_volume as _tv
-    elif provider in CLI_PROVIDERS:
-        from functools import partial
-
-        from src.CLI.agent import translate_volume as _cli_tv
-
-        _tv = partial(_cli_tv, provider=provider)
-    else:
-        raise ValueError(
-            f"Unsupported translation provider: {provider!r}; expected one of {', '.join(PROVIDERS)}"
-        )
-    return _tv
 
 
 def _prep_provider(explicit: str | None, translation_provider: str | None) -> str | None:
@@ -303,7 +278,8 @@ def cmd_prep(args: argparse.Namespace) -> int:
     print(f"  Characters: {receipt['character_count']}")
     print(f"  Series:     {receipt['series_id'] or '(not detected)'}"
           + (" [sequel — bible loaded]" if receipt["is_sequel"] else ""))
-    print(f"  Blocks populated: {len(receipt['blocks_populated'])}/15")
+    print(f"  Blocks populated: {len(receipt['blocks_populated'])}"
+          f"/{len(receipt['blocks_populated']) + len(receipt['blocks_pending'])}")
     if receipt["blocks_pending"]:
         print(f"  Still pending:    {', '.join(receipt['blocks_pending'])}")
     _after_prep(args.volume_id, assistant_provider=args.prep_provider if args.prep_provider in CLI_PROVIDERS else None)
@@ -367,7 +343,7 @@ def cmd_build(args: argparse.Namespace) -> int:
         emit_xtc=args.emit_xtc,
     )
     if result.success and result.dry_run:
-        print(f"\nDry run — EPUB structure assembled, no .epub packaged:")
+        print("\nDry run — EPUB structure assembled, no .epub packaged:")
         print(f"  {result.debug_dir}")
         return 0
     if result.success:
@@ -413,7 +389,8 @@ def _continue_pipeline(volume_id: str, *, provider: str | None, series_id: str |
                 print("       No API key? Prep can also run through a signed-in CLI: "
                       "--prep-provider claude (Claude Code) or --prep-provider codex (Codex CLI).")
             return 1
-        print(f"[prep] {len(prep_receipt['blocks_populated'])}/15 context.xml blocks populated")
+        print(f"[prep] {len(prep_receipt['blocks_populated'])}"
+              f"/{len(prep_receipt['blocks_populated']) + len(prep_receipt['blocks_pending'])} context.xml blocks populated")
         _after_prep(volume_id, assistant_provider=chosen_prep if chosen_prep in CLI_PROVIDERS else None)
     else:
         print("[prep] already completed" if not skip_prep else "[prep] skipped")
@@ -461,6 +438,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     if _is_url(source):
         from src.utility.webimport.http import AccessDenied
         from src.utility.webimport.importer import import_work, parse_range
+        from src.utility.webimport.models import AdapterError
 
         try:
             result = import_work(source, target_language=lang, episode_range=parse_range(args.range),
@@ -468,6 +446,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         except AccessDenied as exc:
             print(f"[1/5] Import stopped: {exc}")
             return 2
+        except (AdapterError, ValueError) as exc:
+            print(f"[1/5] Import failed: {exc}")
+            return 1
         if not result.complete:
             print(f"[1/5] Import incomplete ({len(result.failed)} episode(s) failed) — re-run to resume")
             return 1

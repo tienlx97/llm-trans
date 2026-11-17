@@ -1,4 +1,5 @@
 import type { ConfigFieldState } from './configFile.js';
+import { deepseekPricingStatusAt } from './deepseekPricing.js';
 
 type Rates = Readonly<{
   input: number;
@@ -64,16 +65,9 @@ const PRICING: Readonly<Record<string, ModelPricing>> = {
     standardRates: { input: 0.1, cacheRead: 0.01, cacheWrite: 0.125, output: 0.5 },
     note: 'For requests over 272K input tokens: input/cache/write 2×; output 1.5×.',
   },
-  'deepseek-v4-flash': {
-    providerLabel: 'DeepSeek', displayName: 'DeepSeek-V4-Flash', source: 'https://api-docs.deepseek.com/quick_start/pricing/', sourceLabel: 'DeepSeek API pricing docs',
-    standardRates: { input: 0.14, cacheRead: 0.0028, cacheWrite: null, output: 0.28 },
-    note: 'Current official API tariff is flat; no peak-hour window is published.',
-  },
-  'deepseek-v4-pro': {
-    providerLabel: 'DeepSeek', displayName: 'DeepSeek-V4-Pro', source: 'https://api-docs.deepseek.com/quick_start/pricing/', sourceLabel: 'DeepSeek API pricing docs',
-    standardRates: { input: 0.435, cacheRead: 0.003625, cacheWrite: null, output: 0.87 },
-    note: 'Current official API tariff is flat; no peak-hour window is published.',
-  },
+  // DeepSeek has no row here: its tariff is peak/off-peak clock-sensitive and
+  // comes from src/Deepseek/common/deepseek_pricing.json, the same file the
+  // Python estimator reads (see deepseekStatus below).
   'qwen3.7-max': {
     providerLabel: 'QwenCloud', displayName: 'Qwen 3.7 Max', source: 'https://www.qwencloud.com/models/qwen3.7-max', sourceLabel: 'QwenCloud model pricing',
     standardRates: { input: 2.5, cacheRead: 0.5, cacheWrite: 3.125, output: 7.5 }, explicitCacheRead: 0.25,
@@ -133,12 +127,12 @@ const PRICING: Readonly<Record<string, ModelPricing>> = {
     standardRates: { input: 2, cacheRead: 0.2, cacheWrite: 2.5, output: 10 },
     note: 'Cache read is 10% of input; cache write is the 5-minute TTL rate (125% of input); the 1h TTL rate is $4/MTok.',
   },
-  // Mirrors token_telemetry.py's claude-sonnet-5-5 row: Anthropic's own
+  // Mirrors token_telemetry.py's claude-sonnet-5-5 row (cache read $0.10). Anthropic's own
   // migration guide states Sonnet 5.5 "has the same prices as Claude Sonnet 5".
   'claude-sonnet-5-5': {
     providerLabel: 'Anthropic', displayName: 'Claude Sonnet 5.5', source: 'https://platform.claude.com/docs/en/models/sonnet-5-5/overview', sourceLabel: 'Anthropic Sonnet 5.5 model page',
-    standardRates: { input: 2, cacheRead: 0.2, cacheWrite: 2.5, output: 10 },
-    note: 'Same prices as Claude Sonnet 5. Cache read is 10% of input; cache write is the 5-minute TTL rate (125% of input); the 1h TTL rate is $4/MTok.',
+    standardRates: { input: 2, cacheRead: 0.1, cacheWrite: 2.5, output: 10 },
+    note: 'Same input/output prices as Claude Sonnet 5; cache read is 5% of input ($0.10/MTok), half the Sonnet 5 rate. Cache write is the 5-minute TTL rate (125% of input); the 1h TTL rate is $4/MTok.',
   },
   'claude-opus-5': {
     providerLabel: 'Anthropic', displayName: 'Claude Opus 5', source: 'https://www.anthropic.com/news/claude-opus-5', sourceLabel: 'Anthropic Opus 5 announcement',
@@ -206,9 +200,27 @@ function currentPromotion(pricing: ModelPricing, clock: Date): Promotion | undef
   return now >= start && now < end ? promotion : undefined;
 }
 
+function deepseekStatus(model: string, clock: Date): TranslationPricingStatus {
+  const tariff = deepseekPricingStatusAt(clock);
+  // Same fallback as token_telemetry._rates_for_model: any *flash* id bills at
+  // Flash, everything else at V4 Pro.
+  const key = tariff.ratesByModel[model] ? model : model.includes('flash') ? 'deepseek-flash' : 'deepseek-v4-pro';
+  const rates = tariff.ratesByModel[key];
+  return {
+    provider: 'deepseek', model, providerLabel: 'DeepSeek', displayName: tariff.modelDisplayNames[key] ?? (model || 'No configured model'),
+    rates: rates ? { input: rates.cache_miss, cacheRead: rates.cache_hit, cacheWrite: null, output: rates.output } : null,
+    rateLabel: `${tariff.label} API pricing · ${tariff.utcTime}`,
+    condition: tariff.peakNote,
+    cacheReadLabel: 'cache read', cacheWriteLabel: 'cache write',
+    source: tariff.source, sourceLabel: 'DeepSeek API pricing docs',
+    note: 'Off-peak rates are half of peak. Automatic prefix cache: no cache-write charge.',
+  };
+}
+
 export function translationPricingStatus(fields: readonly ConfigFieldState[], clock: Date = new Date()): TranslationPricingStatus {
   const provider = configuredValue(fields, 'translation.provider').toLowerCase();
   const model = configuredValue(fields, `translation.${provider}.model`).toLowerCase();
+  if (provider === 'deepseek') return deepseekStatus(model, clock);
   const pricing = PRICING[model];
   if (!pricing) {
     const labels: Readonly<Record<string, string>> = { qwen: 'Qwen / Model Studio', deepseek: 'DeepSeek', openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Google Gemini' };

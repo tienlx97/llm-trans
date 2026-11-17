@@ -1,12 +1,8 @@
 """Main MCP server entry point for LLM Translator.
 
-Slimmed from the main pipeline's 8 tool servers / ~42 tools / 8 resource
-groups down to 6 tool servers (librarian, prep, translator, qc, bible,
-builder), 20 tools, and 2 resources (persona + phase routing — see
-src/mcp/harness.py). No prompt templates. The main MTLS skills this client
-would otherwise need (Prep, Translator, QC, Bible Writer) are reified as MCP
-tools instead of markdown documents the IDE agent reads and manually
-executes — one tool call per phase, no manual orchestration.
+6 tool servers (librarian, prep, translator, qc, bible, builder), 20 tools,
+and 2 resources (persona + phase routing — see harness.py). No prompt
+templates: each phase is one tool call, no manual orchestration.
 """
 
 from __future__ import annotations
@@ -27,8 +23,9 @@ from src.Deepseek.mcp.servers.translator_server import register_translator_tools
 MCP_INSTRUCTIONS = (
     "LLM Translator lightweight pipeline tools: "
     "Phase 1 librarian extraction, "
-    "Phase 1.P cached multi-turn DeepSeek prep (fills context.xml, no Gemini/main-pipeline dependency), "
-    "Phase 2 DeepSeek V4 Pro translation, "
+    "Phase 1.P prep (fills context.xml via prep.provider), "
+    "Phase 2 translation through translation.provider "
+    "(deepseek | qwen | openai | anthropic | gemini | codex | claude), "
     "QC gate (filesystem-only sanity checks), "
     "Bible Writer (cross-volume series continuity), "
     "Phase 4 builder packaging. "
@@ -71,7 +68,6 @@ def create_mcp_server() -> Any:
     register_builder_tools(mcp, cfg)
 
     # Resources (not tools) — persona propagation + phase->tool routing.
-    # See src/mcp/harness.py.
     register_harness_resources(mcp, cfg)
 
     return mcp

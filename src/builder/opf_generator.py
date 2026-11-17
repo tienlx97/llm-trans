@@ -7,8 +7,8 @@ following Yen Press / J-Novel Club conventions.
 
 import uuid
 from pathlib import Path
-from datetime import datetime
-from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import List, Optional
 from html import escape
 
@@ -46,8 +46,10 @@ class ManifestItem:
 
     def to_xml(self) -> str:
         """Generate XML element for this item."""
-        props = f' properties="{self.properties}"' if self.properties else ""
-        return f'    <item id="{self.id}" href="{self.href}" media-type="{self.media_type}"{props}/>'
+        # Attribute values are escaped: an image name from a source EPUB can
+        # carry '&', which would make the whole package document invalid XML.
+        props = f' properties="{escape(self.properties)}"' if self.properties else ""
+        return f'    <item id="{escape(self.id)}" href="{escape(self.href)}" media-type="{self.media_type}"{props}/>'
 
 
 @dataclass
@@ -59,7 +61,7 @@ class SpineItem:
     def to_xml(self) -> str:
         """Generate XML element for this item."""
         linear_attr = f' linear="{self.linear}"' if self.linear != "yes" else ""
-        return f'    <itemref idref="{self.idref}"{linear_attr}/>'
+        return f'    <itemref idref="{escape(self.idref)}"{linear_attr}/>'
 
 
 class OPFGenerator:
@@ -175,7 +177,7 @@ class OPFGenerator:
                 lines.append(f'    <meta refines="#series01" property="group-position">{metadata.series_index}</meta>')
 
         # Modified timestamp (required for EPUB3)
-        modified = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # utcnow() is deprecated
         lines.append(f'    <meta property="dcterms:modified">{modified}</meta>')
 
         # Cover image meta
@@ -211,24 +213,3 @@ class OPFGenerator:
         lines.append("  </spine>")
 
         return "\n".join(lines)
-
-
-def generate_opf(
-    output_path: Path,
-    metadata: BookMetadata,
-    manifest_items: List[ManifestItem],
-    spine_items: List[SpineItem],
-    cover_image_id: Optional[str] = None
-) -> None:
-    """
-    Main function to generate package.opf file.
-
-    Args:
-        output_path: Path to write package.opf
-        metadata: Book metadata
-        manifest_items: List of manifest entries
-        spine_items: List of spine entries
-        cover_image_id: ID of cover image for meta tag
-    """
-    generator = OPFGenerator()
-    generator.generate(output_path, metadata, manifest_items, spine_items, cover_image_id)

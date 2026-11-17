@@ -162,7 +162,8 @@ class PoliteFetcher:
         clock: Callable[[], float] = time.monotonic,
     ):
         self.user_agent = user_agent
-        self.min_delay = max(1.0, float(min_delay))
+        # Documented floor: at least 2 s between requests, configurable upward only.
+        self.min_delay = max(2.0, float(min_delay))
         self.timeout = float(timeout)
         self.max_retries = max(0, int(max_retries))
         self._transport = transport or _urllib_transport

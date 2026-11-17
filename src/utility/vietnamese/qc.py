@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from src.Deepseek.common.chapter_order import in_reading_order, reading_order
 from src.utility.vietnamese.align import IMAGE_RE, SCENE_BREAK_RE, align, jp_blocks_for_tr, segments, split_blocks
 
 SEVERITIES = ("critical", "major", "minor", "info")
@@ -401,8 +402,7 @@ def run_vi_qc(work_dir: Path, *, llm: bool = False, assistant=None, dry_run: boo
     qc_cfg = cfg.get("qc") or {}
     dialogue_style = str(cfg.get("dialogue_style") or "quotes")
     bible = load_volume_bible(work_dir)
-    jp_files = sorted((work_dir / "JP").glob("*.md"),
-                      key=lambda p: [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", p.stem)])
+    jp_files = in_reading_order((work_dir / "JP").glob("*.md"))
     if chapters:
         wanted = set(chapters)
         jp_files = [p for p in jp_files if p.stem in wanted or p.stem.split("_")[-1] in wanted]
@@ -478,7 +478,7 @@ def render_markdown(report: Dict[str, Any]) -> str:
     by_chapter: Dict[str, List[Dict[str, Any]]] = {}
     for issue in report["issues"]:
         by_chapter.setdefault(issue["chapter_id"], []).append(issue)
-    for chapter_id in sorted(by_chapter):
+    for chapter_id in sorted(by_chapter, key=reading_order):
         lines.append(f"## {chapter_id}")
         for i in sorted(by_chapter[chapter_id], key=lambda x: -SEVERITY_RANK[x["severity"]]):
             loc = f"VI¶{i['vi_block']}" if i.get("vi_block") is not None else "chapter"

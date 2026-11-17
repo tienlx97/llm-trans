@@ -21,8 +21,10 @@ export type ConfigFieldSpec = {
   readonly max?: number;
 };
 
-const MODEL_CHOICES = ['deepseek-v4-pro', 'deepseek-v4-flash'] as const;
-const MODEL_LABELS = ['DeepSeek-V4-Pro-0813', 'DeepSeek-V4-Flash-0731'] as const;
+// deepseek-flash is the current Flash id (DeepSeek-V4.1-Flash-1017); the legacy
+// deepseek-v4-flash is still accepted by the API and billed at the same price.
+const MODEL_CHOICES = ['deepseek-v4-pro', 'deepseek-flash', 'deepseek-v4-flash'] as const;
+const MODEL_LABELS = ['DeepSeek-V4-Pro-0813', 'DeepSeek-V4.1-Flash-1017', 'DeepSeek Flash (legacy id)'] as const;
 const PROVIDER_CHOICES = ['deepseek', 'qwen', 'openai', 'anthropic', 'gemini', 'codex', 'claude'] as const;
 const PROVIDER_LABELS = ['DeepSeek', 'Qwen', 'OpenAI', 'Anthropic', 'Google Gemini', 'Codex CLI (ChatGPT plan)', 'Claude Code (Claude plan)'] as const;
 // Mirrors SUPPORTED_MODELS / THINKING_LEVELS in src/Gemini/client.py. "minimal"
@@ -44,7 +46,7 @@ const QWEN_MODEL_CHOICES = ['qwen3.7-max', 'qwen3.8-max', 'qwen3.7-plus', 'qwen3
 const QWEN_MODEL_LABELS = ['Qwen 3.7 Max — frontier-class', 'Qwen 3.8 Max — frontier-class', 'Qwen 3.7 Plus — balanced', 'Qwen 3.7 Flash — economy'] as const;
 const ENDPOINT_CHOICES = ['https://api.deepseek.com/anthropic', 'https://api.deepseek.com'] as const;
 const ENDPOINT_LABELS = ['Anthropic', 'OpenAI'] as const;
-const EFFORT_CHOICES = ['max', 'high', 'medium', 'low'] as const;
+const EFFORT_CHOICES = ['max', 'xhigh', 'high', 'medium', 'low'] as const;
 const OPENAI_REASONING_MODE_CHOICES = ['standard', 'pro'] as const;
 const OPENAI_REASONING_EFFORT_CHOICES = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 const OPENAI_REASONING_CONTEXT_CHOICES = ['auto', 'current_turn', 'all_turns'] as const;
@@ -95,12 +97,6 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { path: 'project.name', menu: 'Project', section: 'Project', label: 'Project Name', kind: 'text', description: 'Display name for this pipeline instance. Cosmetic only.' },
   { path: 'project.version', menu: 'Project', section: 'Project', label: 'Config Version', kind: 'text', description: 'Version tag for this config file. Cosmetic only, not read for compatibility checks.' },
 
-// ─── Paths ───────────────────────────────────────────────────────────────────────
-  { path: 'paths.input_dir', menu: 'Paths', section: 'File System Paths', label: 'Input Directory', kind: 'text', description: 'Where extract/run look for source EPUBs.' },
-  { path: 'paths.work_dir', menu: 'Paths', section: 'File System Paths', label: 'Work Directory', kind: 'text', description: 'Per-volume working directories (JP/EN/manifest.json/etc.) live under here.' },
-  { path: 'paths.output_dir', menu: 'Paths', section: 'File System Paths', label: 'Output Directory', kind: 'text', description: 'Final assembled EPUBs are written here.' },
-  { path: 'paths.prompt_dir', menu: 'Paths', section: 'File System Paths', label: 'Prompt Directory', kind: 'text', description: 'Base directory for the master translation prompt XML files.' },
-  { path: 'paths.log_dir', menu: 'Paths', section: 'File System Paths', label: 'Log Directory', kind: 'text', description: 'Debug and cost logs are written here.' },
 
 // ─── Prep ────────────────────────────────────────────────────────────────────────
   { path: 'prep.provider', menu: 'Prep', section: 'Provider', label: 'Provider', kind: 'enum', choices: PREP_PROVIDER_CHOICES, choiceLabels: PREP_PROVIDER_LABELS,
@@ -119,7 +115,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { path: 'prep.openai.batch.resume_completed_blocks', menu: 'Prep', section: 'OpenAI — Responses & Batch', label: 'Resume Completed Blocks', kind: 'boolean', description: 'Reuse validated local JSON-node artifacts on restart.' },
   { path: 'prep.openai.batch.persistence_file', menu: 'Prep', section: 'OpenAI — Responses & Batch', label: 'Batch Ledger Path', kind: 'text', description: 'Durable local record of accepted OpenAI Batch jobs.' },
   { path: 'prep.model', menu: 'Prep', section: 'Context Build', label: 'Model', kind: 'enum', choices: MODEL_CHOICES, choiceLabels: MODEL_LABELS,
-    description: 'Model for the single call that fills context.xml. Flash trades instruction-following for throughput — Pro is required for reliable 15-block structured output.' },
+    description: 'Model for the single call that fills context.xml. Flash trades instruction-following for throughput — Pro is required for reliable 16-block structured output.' },
   { path: 'prep.endpoint', menu: 'Prep', section: 'Context Build', label: 'Endpoint', kind: 'enum', choices: ENDPOINT_CHOICES, choiceLabels: ENDPOINT_LABELS,
     description: 'The client only speaks the Anthropic SDK request format — leave this on Anthropic.' },
   { path: 'prep.api_key_env', menu: 'Prep', section: 'Context Build', label: 'API Key Variable', kind: 'text', description: 'Environment variable holding the DeepSeek API key for prep calls.' },
@@ -144,8 +140,6 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
     description: 'Phase 2 translation provider. DeepSeek, Qwen, and OpenAI each own their client, prompt, conversation, and optimization modules.' },
   { path: 'translation.master_prompt', menu: 'Translation', section: 'Prompts', label: 'Primary Translation Prompt', kind: 'text',
     description: 'DeepSeek-route master prompt. Qwen and OpenAI read their own provider-specific prompt path.' },
-  { path: 'translation.master_prompt_v2', menu: 'Translation', section: 'Prompts', label: 'Continuity Translation Prompt', kind: 'text',
-    description: "Literacy-anchor variant, auto-selected for sequels whose context.xml carries prior_volume_anchors." },
   { path: 'translation.thinking_log.enabled', menu: 'Translation', section: 'Thinking Log', label: 'Status', kind: 'boolean',
     description: "Archive DeepSeek's reasoning_content per chapter to disk. Reasoning tokens are billed either way — this only controls whether the audit trail is saved." },
   { path: 'translation.thinking_log.output_dir', menu: 'Translation', section: 'Thinking Log', label: 'Output Directory', kind: 'text',
@@ -201,23 +195,10 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
     description: 'Reasoning Directive Injection — EPS-band CoT scaffolding injected into the user turn, since DeepSeek ignores the Anthropic effort parameter natively.' },
   { path: 'translation.deepseek.optimizations.dovb.enabled', menu: 'Translation', section: 'DeepSeek — Optimizations — DOVB', label: 'Status', kind: 'boolean',
     description: 'Voice Block — explicit contraction/forbidden-vocab/register templates. Off = voice guidance comes only from context.xml and the master prompt.' },
-  { path: 'translation.deepseek.optimizations.concurrent_chapters.enabled', menu: 'Translation', section: 'DeepSeek — Optimizations — Concurrent Chapters', label: 'Status', kind: 'boolean',
-    description: 'Opt-in parallel chapter translation. Not wired into the default flow — conversation history is ordered/append-only and cannot be shared across concurrent chapters.' },
-  { path: 'translation.deepseek.optimizations.concurrent_chapters.max_concurrent', menu: 'Translation', section: 'DeepSeek — Optimizations — Concurrent Chapters', label: 'Maximum Concurrent Chapters', kind: 'integer', min: 1,
-    description: 'Parallel chapter cap. Forced to 1 in code regardless of this value — kept for a future safe implementation.' },
-  { path: 'translation.deepseek.streaming.enabled', menu: 'Translation', section: 'DeepSeek — Streaming', label: 'Status', kind: 'boolean',
-    description: 'Stream text/thinking deltas as they arrive instead of waiting for the full response.' },
   { path: 'translation.deepseek.post_processing.scene_break_formatting', menu: 'Translation', section: 'DeepSeek — Post-Processing', label: 'Scene-Break Formatting', kind: 'boolean',
     description: 'Normalize scene breaks (＊ ＊ ＊ → centered asterism, etc.) in translated output.' },
   { path: 'translation.deepseek.post_processing.cjk_cleanup', menu: 'Translation', section: 'DeepSeek — Post-Processing', label: 'CJK Cleanup', kind: 'boolean',
     description: 'Strip CJK artifact characters (fullwidth punctuation, ideographic spaces) that leak into EN output.' },
-  { path: 'translation.deepseek.post_processing.salvage_reasoning_leaked_answer', menu: 'Translation', section: 'DeepSeek — Post-Processing', label: 'Recover Leaked Reasoning Answers', kind: 'boolean',
-    description: 'Recover chapters DeepSeek accidentally emitted into reasoning_content instead of content — a known API edge case.' },
-  { path: 'translation.deepseek.retry.max_retries', menu: 'Translation', section: 'DeepSeek — Retry', label: 'Maximum Retries', kind: 'integer', min: 0, description: 'Maximum retry attempts on a failed API call.' },
-  { path: 'translation.deepseek.retry.base_delay_ms', menu: 'Translation', section: 'DeepSeek — Retry', label: 'Retry Base Delay (ms)', kind: 'integer', min: 0, description: 'Starting backoff delay between retries.' },
-  { path: 'translation.deepseek.retry.max_delay_ms', menu: 'Translation', section: 'DeepSeek — Retry', label: 'Retry Maximum Delay (ms)', kind: 'integer', min: 0, description: 'Backoff delay ceiling.' },
-  { path: 'translation.deepseek.retry.jitter_factor', menu: 'Translation', section: 'DeepSeek — Retry', label: 'Retry Jitter', kind: 'float', min: 0, max: 1, description: 'Random jitter fraction applied to each backoff delay, to avoid retry storms.' },
-  { path: 'translation.deepseek.retry.max_529_retries', menu: 'Translation', section: 'DeepSeek — Retry', label: 'Maximum Overload Retries', kind: 'integer', min: 0, description: 'Separate, tighter retry cap specifically for 529 Overloaded responses.' },
   { path: 'translation.qwen.model', menu: 'Translation', section: 'Qwen — Model & Connection', label: 'Model', kind: 'enum', choices: QWEN_MODEL_CHOICES, choiceLabels: QWEN_MODEL_LABELS,
     description: 'Qwen Phase 2 model. Qwen 3.8 Max is the quality tier; Plus and Flash trade quality for throughput.' },
   { path: 'translation.qwen.endpoint', menu: 'Translation', section: 'Qwen — Model & Connection', label: 'Endpoint', kind: 'text',
@@ -516,7 +497,6 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
     choices: DEVICE_PROFILE_CHOICES, choiceLabels: DEVICE_PROFILE_LABELS,
     description: 'Default build target; overridable per run from the Build form. The XTEINK profiles fit art to the panel, convert it to grayscale and force baseline JPEG (progressive does not decode on those devices), and ship a stylesheet limited to the nine CSS properties the firmware implements.' },
 
-  { path: 'builder.fonts.enabled', menu: 'Builder', section: 'Fonts', label: 'Status', kind: 'boolean', description: 'Nominally embeds CJK-coverage fonts. Currently inert: the font list in src/builder/config.py names four files that are not in this repository, and nothing calls the embedder.' },
   { path: 'builder.images.max_width_px', menu: 'Builder', section: 'Images', label: 'Maximum Width (px)', kind: 'integer', min: 1, description: 'Width ceiling for cover/kuchie/illustration art. Read by the Standard profile only — the XTEINK profiles derive their box from the panel instead.' },
   { path: 'builder.images.max_height_px', menu: 'Builder', section: 'Images', label: 'Maximum Height (px)', kind: 'integer', min: 1, description: 'Height ceiling for cover/kuchie/illustration art. Standard profile only.' },
   { path: 'builder.images.jpeg_quality', menu: 'Builder', section: 'Images', label: 'JPEG Quality', kind: 'integer', min: 1, max: 100, description: 'JPEG re-encode quality (1-100) for the Standard profile. The XTEINK profiles use 72, tuned for a panel that dithers to one bit anyway.' },
@@ -535,25 +515,8 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { path: 'builder.xtc.timeout_seconds', menu: 'Builder', section: 'XTC Export', label: 'Timeout (seconds)', kind: 'integer', min: 60,
     description: 'Ceiling for one conversion. Rendering every page of a volume to a bitmap is minutes of work, not seconds.' },
 
-// ─── Logging ─────────────────────────────────────────────────────────────────────
-  { path: 'logging.level', menu: 'Logging', section: 'Logging', label: 'Log Level', kind: 'enum', choices: ['DEBUG', 'INFO', 'WARNING', 'ERROR'], description: 'Log verbosity for the whole pipeline.' },
-  { path: 'logging.file', menu: 'Logging', section: 'Logging', label: 'Log File', kind: 'text', description: "Path to the pipeline's log file." },
-  { path: 'logging.cost_tracking', menu: 'Logging', section: 'Logging', label: 'Cost Tracking', kind: 'boolean', description: 'Log per-chapter API cost (input/output/cache tokens → USD) alongside normal logging.' },
 
-// ─── MCP ─────────────────────────────────────────────────────────────────────────
-  { path: 'mcp_harness.persona.file', menu: 'MCP', section: 'Persona', label: 'Persona File', kind: 'text', description: 'Persona file prepended to every LLM system instruction the MCP server builds.' },
-  { path: 'mcp_harness.persona.enabled', menu: 'MCP', section: 'Persona', label: 'Status', kind: 'boolean', description: 'Whether the persona file is actually prepended — the one knob here meant to be casually toggled.' },
-  { path: 'mcp_harness.subagents.prep.enabled', menu: 'MCP', section: 'Subagents — Prep', label: 'Status', kind: 'boolean', description: "Whether the MCP harness's prep subagent is active." },
-  { path: 'mcp_harness.subagents.prep.model', menu: 'MCP', section: 'Subagents — Prep', label: 'Model', kind: 'enum', choices: MODEL_CHOICES, choiceLabels: MODEL_LABELS, description: "Model used by the MCP harness's prep subagent." },
-  { path: 'mcp_harness.subagents.prep.thinking_budget', menu: 'MCP', section: 'Subagents — Prep', label: 'Thinking Budget', kind: 'integer', min: 0, description: "Reasoning token budget for the MCP harness's prep subagent." },
-  { path: 'mcp_harness.subagents.prep.effort', menu: 'MCP', section: 'Subagents — Prep', label: 'Effort', kind: 'enum', choices: EFFORT_CHOICES, description: "Effort level for the MCP harness's prep subagent." },
-  { path: 'mcp_harness.subagents.prep.max_output_tokens', menu: 'MCP', section: 'Subagents — Prep', label: 'Maximum Output Tokens', kind: 'integer', min: 1, description: "Output ceiling for the MCP harness's prep subagent." },
-  { path: 'mcp_harness.subagents.translator.harness_managed', menu: 'MCP', section: 'Subagents — Translator', label: 'Harness Managed', kind: 'boolean',
-    description: 'Off = DeepSeekClient owns translation.deepseek directly (current default). On = the harness would own it instead.' },
-  { path: 'mcp_harness.subagents.qc.enabled', menu: 'MCP', section: 'Subagents — QC', label: 'Status', kind: 'boolean', description: "Whether the MCP harness's QC subagent is active. Filesystem-only — no LLM call regardless." },
 
-// ─── Bible ───────────────────────────────────────────────────────────────────────
-  { path: 'mcp_harness.subagents.bible_writer.enabled', menu: 'Bible', section: 'Writer', label: 'Status', kind: 'boolean', description: "Whether the MCP harness's bible-writer subagent is active. Filesystem-only — no LLM call regardless." },
 ];
 
 export function unquoteYamlScalar(raw: string): string {

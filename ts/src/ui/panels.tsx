@@ -34,11 +34,11 @@ export function Inspector({ volume }: { volume: VolumeSummary | null }) {
   // Keyed on id+updatedAt, not the volume object itself: refresh() rebuilds
   // the whole volumes array (new object identity) on every directory-watcher
   // poll tick regardless of whether this volume actually changed, so identity
-  // would defeat the memo. updatedAt is the manifest's mtime, so EN chapter
+  // would defeat the memo. updatedAt is the manifest's mtime, so chapter
   // counts here can lag a running translation until the manifest itself
-  // updates — an accepted tradeoff for not re-reading every chapter file off
-  // disk on every console line and keystroke while this panel is visible.
+  // updates — an accepted tradeoff for not re-listing the folders on every
+  // console line and keystroke while this panel is visible.
   const detail = useMemo(() => (volume ? loadVolumeDetail(volume.id) : null), [volume?.id, volume?.updatedAt]);
   if (!volume || !detail) return <Box borderStyle="round" borderColor="gray" paddingX={1}><Text color="gray">Select a volume to inspect it.</Text></Box>;
-  return <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1}><Text bold wrap="truncate-end">{volume.title}</Text><Text color="gray" wrap="truncate-end">{volume.author} · {volume.publisher}</Text><Text color="gray" wrap="truncate-end">{volume.series}</Text><ProgressBar value={volume.translatedCount} total={volume.chapterCount} /><PhaseStrip phases={volume.phases} /><Text color="gray">JP {detail.jpChapters} · EN {detail.enChapters} · QC {detail.qcReports}</Text>{volume.manifestError ? <Text color="yellow" wrap="truncate-end">! {volume.manifestError}</Text> : null}{detail.lastError ? <Text color="red" wrap="truncate-end">{detail.lastError}</Text> : null}</Box>;
+  return <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1}><Text bold wrap="truncate-end">{volume.title}</Text><Text color="gray" wrap="truncate-end">{volume.author} · {volume.publisher}</Text><Text color="gray" wrap="truncate-end">{volume.series}</Text><ProgressBar value={volume.translatedCount} total={volume.chapterCount} /><PhaseStrip phases={volume.phases} /><Text color="gray">JP {detail.jpChapters} · {detail.translatedDir} {detail.translatedChapters} · QC {detail.qcReports}</Text>{volume.manifestError ? <Text color="yellow" wrap="truncate-end">! {volume.manifestError}</Text> : null}</Box>;
 }

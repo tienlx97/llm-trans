@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from src.Deepseek.common.chapter_order import in_reading_order, preceding_chapter_id
+from src.Deepseek.common.config import cfg_int
 from src.Anthropic.advisor_prompts import ESCALATION_BLOCK
 from src.Anthropic.client import AnthropicClient
 from src.Anthropic.config import (
@@ -75,6 +77,18 @@ from src.Deepseek.translator.config import get_thinking_log_config
 from src.Deepseek.translator.thinking_output import merge_thinking_log, sanitize_chapter_output
 
 logger = logging.getLogger(__name__)
+
+
+def _block_on_setting(cfg: Dict[str, Any]) -> List[str]:
+    """fidelity_gate.block_on, defaulting only when the key is absent or null.
+
+    An explicit ``[]`` means "record findings, never block" (config.yaml);
+    ``cfg.get("block_on") or [...]`` turned it into "block on everything".
+    """
+    value = cfg.get("block_on")
+    if value is None:
+        return ["missing", "drifted", "structural"]
+    return list(value) if isinstance(value, (list, tuple, set)) else [value]
 # Japanese script only (kana, CJK ideographs, halfwidth katakana). The rest of
 # the U+FF00-FFEF block is NOT stripped: it holds glyphs a translation_policy
 # can require verbatim -- volume 3e35fe lost its ＊ (U+FF0A) POV hand-off here
@@ -173,11 +187,11 @@ class AnthropicTranslator:
         # envelope when the ledger no longer replays that chapter in full.
         # 0 disables the splice.
         self._previous_tail_chars = max(
-            0, int(conversation_cfg.get("previous_chapter_tail_chars", 1200) or 1200)
+            0, cfg_int(conversation_cfg, "previous_chapter_tail_chars", 1200)
         )
         continuation = get_anthropic_continuation_config()
         self.continuation_enabled = bool(continuation.get("enabled", True))
-        self.max_continuations = max(0, int(continuation.get("max_continuations", 3) or 3))
+        self.max_continuations = max(0, cfg_int(continuation, "max_continuations", 3))
         thinking_log_cfg = get_thinking_log_config()
         self.thinking_log_enabled = (
             thinking_log_cfg.get("enabled", True) if thinking_log_enabled is None else thinking_log_enabled
@@ -266,7 +280,7 @@ class AnthropicTranslator:
         paused at all) -- logging both would double-count the same response's
         spend under two labels.
         """
-        pause_budget = max(0, int(self._advisor_cfg.get("max_pause_resumes", 2) or 2))
+        pause_budget = max(0, cfg_int(self._advisor_cfg, "max_pause_resumes", 2))
         pause_count = 0
         resumed_responses: List[Any] = []
         while response.termination == LLMTermination.PAUSED and pause_count < pause_budget:
@@ -444,7 +458,7 @@ class AnthropicTranslator:
         gate_enabled = bool(cfg.get("enabled", True))
         block_on = {
             str(item).strip().lower()
-            for item in (cfg.get("block_on") or ["missing", "drifted", "structural"])
+            for item in _block_on_setting(cfg)
         }
         try:
             tolerance = float(cfg.get("ratio_tolerance", DEFAULT_RATIO_TOLERANCE) or DEFAULT_RATIO_TOLERANCE)
@@ -583,18 +597,10 @@ class AnthropicTranslator:
     def _preceding_chapter_id(self, chapter_id: str) -> Optional[str]:
         """The chapter id immediately before this one, or None.
 
-        Derived from the trailing digits and re-padded to the same width, so
-        CHAPTER_07 yields CHAPTER_06 rather than CHAPTER_6. A stem with no
-        trailing number, or the first chapter, gets None rather than a guess.
+        A stem with no trailing number, or the first chapter, gets None rather
+        than a guess. See chapter_order.preceding_chapter_id for the padding rule.
         """
-        match = _CHAPTER_INDEX_RE.match(str(chapter_id))
-        if match is None:
-            return None
-        prefix, digits = match.group(1), match.group(2)
-        index = int(digits)
-        if index <= 1:
-            return None
-        return "%s%0*d" % (prefix, len(digits), index - 1)
+        return preceding_chapter_id(chapter_id)
 
     def _chapter_tail_from_disk(self, chapter_id: str) -> str:
         """The closing passage of an already-translated chapter, from EN/.
@@ -818,10 +824,19 @@ class AnthropicTranslator:
             thinking_blocks=_thinking_tally(chapter_responses),
         )
         if manager is not None:
+            # After a pause-resume or an output-cap continuation,
+            # assistant_message is only the LAST fragment of the chapter, so
+            # replaying it would show later chapters a chapter missing its
+            # opening. Commit the whole chapter as plain text instead (its
+            # thinking blocks belong to the individual calls and are dropped).
+            fragmented = len(chapter_responses) > 1
             manager.commit(
                 chapter_id=chapter_id,
                 user_message=chapter_user_message,
-                assistant_message=assistant_message,
+                assistant_message=(
+                    {"role": "assistant", "content": [{"type": "text", "text": text}]}
+                    if fragmented else assistant_message
+                ),
                 chapter_text=text,
                 output_path=self.work_dir / "EN" / f"{chapter_id}_EN.md",
             )
@@ -1043,7 +1058,7 @@ class AnthropicTranslator:
         output_path = self.work_dir / "EN" / f"{chapter_id}_EN.md"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         text = self._reinject_illustrations(chapter_id, text)
-        output_path.write_text(text, encoding="utf-8")
+        atomic_write_text(output_path, text)
         blocking = self._check_chapter_fidelity(chapter_id, text)
         if blocking:
             # The text stays on disk so it can be inspected and diffed, but the
@@ -1067,7 +1082,7 @@ class AnthropicTranslator:
     def translate_all(self, chapter_files: List[Path]) -> Dict[str, Path]:
         return {
             path.stem: self.translate_and_persist_chapter(path, {"chapter_id": path.stem})
-            for path in sorted(chapter_files)
+            for path in in_reading_order(chapter_files)
         }
 
     def translate_volume_batch(self, chapter_files: List[Path]) -> Dict[str, Path]:
@@ -1105,7 +1120,7 @@ class AnthropicTranslator:
         from src.Anthropic.batch import BatchLedger, retrieve_batch_results, submit_batch
 
         batch_cfg = get_anthropic_batch_config()
-        pending = sorted(chapter_files)
+        pending = in_reading_order(chapter_files)
         if not pending:
             return {}
 
@@ -1582,7 +1597,12 @@ class AnthropicTranslator:
                 manager.commit(
                     chapter_id=chapter_id,
                     user_message=_user_message(prompts[chapter_id]),
-                    assistant_message=_assistant_message(response),
+                    # After a pause-resume `response` holds only the last
+                    # fragment; replay the whole chapter (see translate_chapter).
+                    assistant_message=(
+                        {"role": "assistant", "content": [{"type": "text", "text": text}]}
+                        if extra_responses else _assistant_message(response)
+                    ),
                     chapter_text=text,
                     output_path=output_path,
                 )
@@ -1663,7 +1683,7 @@ class AnthropicTranslator:
         output_path = self.work_dir / "EN" / f"{chapter_id}_EN.md"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         text = self._reinject_illustrations(chapter_id, text)
-        output_path.write_text(text, encoding="utf-8")
+        atomic_write_text(output_path, text)
         return output_path, self._check_chapter_fidelity(chapter_id, text)
 
     def _history_cache_control(self) -> Optional[Dict[str, Any]]:
@@ -1872,7 +1892,7 @@ def reconcile_manifest_from_disk(work_dir: Path) -> Dict[str, str]:
     cfg = get_anthropic_fidelity_config()
     block_on = {
         str(item).strip().lower()
-        for item in (cfg.get("block_on") or ["missing", "drifted", "structural"])
+        for item in _block_on_setting(cfg)
     }
     try:
         tolerance = float(cfg.get("ratio_tolerance", DEFAULT_RATIO_TOLERANCE) or DEFAULT_RATIO_TOLERANCE)
@@ -1994,7 +2014,7 @@ def translate_volume(
     jp_dir = work_dir / "JP"
     if not jp_dir.is_dir():
         raise FileNotFoundError(f"No JP/ directory for volume {volume_id!r} at {jp_dir}")
-    chapter_files = sorted(jp_dir.glob("CHAPTER_*.md"))
+    chapter_files = in_reading_order(jp_dir.glob("CHAPTER_*.md"))
     if chapters:
         wanted = set(chapters)
         chapter_files = [path for path in chapter_files if path.stem in wanted or path.stem.split("_")[-1] in wanted]

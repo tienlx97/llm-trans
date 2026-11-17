@@ -36,6 +36,9 @@ import src.utility.qc.agent  # noqa: E402,F401
 import src.utility.librarian.agent  # noqa: E402,F401
 import src.utility.webimport.importer  # noqa: E402,F401
 import src.utility.prep.agent  # noqa: E402,F401
+import src.utility.prep.multiturn_agent  # noqa: E402,F401
+import src.utility.prep.parallel_agent  # noqa: E402,F401
+import src.OpenAI.prep  # noqa: E402,F401
 import src.CLI.agent  # noqa: E402,F401
 
 

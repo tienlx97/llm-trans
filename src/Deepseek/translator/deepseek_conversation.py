@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from src.Deepseek.common.atomic_io import atomic_write_json
+from src.Deepseek.common.token_estimate import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ class DeepSeekConversationManager:
         self.checkpoint_stuck_guard_turns = int(
             self.config.get("checkpoint_stuck_guard_turns", 2) or 0
         )
-        self._token_counter = token_counter or (lambda text: max(1, len(text or "") // 4))
+        self._token_counter = token_counter or estimate_tokens
 
         raw_path = str(
             self.config.get(
@@ -460,10 +461,6 @@ class DeepSeekConversationManager:
         self.state["system_hash"] = current["system_hash"]
         return reasons
 
-    def _set_system(self, system: Any) -> None:
-        """System-only shape capture (kept for callers that carry no tools)."""
-        self._set_prefix_shape(system, tools=None)
-
     def cache_miss_attribution(
         self,
         *,
@@ -584,46 +581,6 @@ class DeepSeekConversationManager:
         }
         return int(self._token_counter(_json_stable(payload)))
 
-    def _canonical_overlay(self) -> str:
-        """Build deterministic canon receipts appended to generated checkpoints."""
-        blocks: List[str] = []
-        for relative_path, label in (
-            (Path(".context") / "name_registry.json", "EXACT NAME REGISTRY"),
-            (Path(".context") / "cultural_glossary_en.json", "EXACT TERM GLOSSARY"),
-            (Path(".context") / "arc_tracker.json", "ARC CLOSING STATE"),
-            (Path("term_lock.json"), "EXACT TERM LOCKS"),
-            (Path("VREC_ANCHORS_V1.0.json"), "EXACT CALLBACK ANCHORS"),
-        ):
-            path = self.work_dir / relative_path
-            if not path.exists():
-                continue
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if payload:
-                blocks.append(
-                    f"## {label}\n```json\n"
-                    f"{json.dumps(payload, ensure_ascii=False, sort_keys=True)}\n```"
-                )
-
-        ecr_dir = self.work_dir / "cache"
-        ecr_payload: Dict[str, Any] = {}
-        if ecr_dir.exists():
-            for path in sorted(ecr_dir.glob("ecr_decisions_*.json")):
-                try:
-                    value = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if value:
-                    ecr_payload[path.stem] = value
-        if ecr_payload:
-            blocks.append(
-                "## EXACT ECR DECISIONS\n```json\n"
-                f"{json.dumps(ecr_payload, ensure_ascii=False, sort_keys=True)}\n```"
-            )
-        return "\n\n".join(blocks)
-
     @staticmethod
     def _strip_checkpoint_fence(content: str) -> str:
         text = (content or "").strip()
@@ -731,20 +688,6 @@ class DeepSeekConversationManager:
             )
             validation_errors = self._validate_checkpoint(content, coverage)
             if not validation_errors:
-                overlay = self._canonical_overlay()
-                if overlay:
-                    safe_overlay = overlay.replace("]]>", "]]]]><![CDATA[>")
-                    closing_tag = "</deepseek_volume_checkpoint>"
-                    overlay_section = (
-                        '<section name="deterministic_canon_overlay"><![CDATA['
-                        f"{safe_overlay}"
-                        "]]></section>"
-                    )
-                    content = content.replace(
-                        closing_tag,
-                        f"{overlay_section}{closing_tag}",
-                        1,
-                    )
                 self.state["checkpoint"] = content
                 self.state["checkpoint_chapter_ids"] = coverage
                 self.state["checkpoint_generation"] = int(

@@ -108,12 +108,17 @@ def save_bible(path: Path, bible: Dict[str, Any]) -> Path:
 
 # ── ordering ──────────────────────────────────────────────────────────────
 
-def chapter_order(chapter_id: Optional[str]) -> Tuple[int, int, str]:
-    """``series`` < any chapter; chapters sort by their trailing number."""
+def chapter_order(chapter_id: Optional[str]) -> Tuple[int, Tuple[int, ...], str]:
+    """``series`` < any chapter; chapters sort by every number in the id.
+
+    All of them, not only the last: a split chapter is CHAPTER_05_PART_01, and
+    ordering it by its trailing "01" put it before CHAPTER_03, hiding from it
+    every character and address pair introduced in chapters 2-5.
+    """
     if not chapter_id or chapter_id == SERIES:
-        return (0, 0, "")
-    digits = re.findall(r"\d+", str(chapter_id))
-    return (1, int(digits[-1]) if digits else 0, str(chapter_id))
+        return (0, (), "")
+    numbers = tuple(int(n) for n in re.findall(r"\d+", str(chapter_id)))
+    return (1, numbers, str(chapter_id))
 
 
 def effective_at(introduced_in: Optional[str], chapter_id: Optional[str]) -> bool:

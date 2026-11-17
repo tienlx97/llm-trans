@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.Deepseek.common.atomic_io import atomic_write_json
+from src.Deepseek.common.token_estimate import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ class QwenConversationManager:
     def estimated_tokens(self, messages: Optional[List[Dict[str, Any]]] = None) -> int:
         payload = messages if messages is not None else self._all_messages()
         text = json.dumps(payload, ensure_ascii=False)
-        return max(1, len(text) // 4)
+        return estimate_tokens(text)
 
     def messages(self, system: str, user: str, recent_count: Optional[int] = None) -> List[Dict[str, Any]]:
         _ = system  # system is sent as the top-level Anthropic parameter, not a message role

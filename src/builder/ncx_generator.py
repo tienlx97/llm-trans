@@ -7,7 +7,7 @@ compatibility with older e-readers that don't support EPUB3 navigation.
 
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 from html import escape
 
 
@@ -27,7 +27,7 @@ class NavPoint:
         lines.append(f'{spaces}  <navLabel>')
         lines.append(f'{spaces}    <text>{escape(self.label)}</text>')
         lines.append(f'{spaces}  </navLabel>')
-        lines.append(f'{spaces}  <content src="{self.src}"/>')
+        lines.append(f'{spaces}  <content src="{escape(self.src)}"/>')
 
         # Nested nav points
         for child in self.children:
@@ -98,107 +98,3 @@ class NCXGenerator:
     def _build_nav_map(self, nav_points: List[NavPoint]) -> str:
         """Build navMap content from navigation points."""
         return "\n".join(np.to_xml(indent=2) for np in nav_points)
-
-    @staticmethod
-    def create_nav_point(
-        nav_id: str,
-        label: str,
-        src: str,
-        play_order: int,
-        children: Optional[List[NavPoint]] = None
-    ) -> NavPoint:
-        """
-        Helper to create a NavPoint.
-
-        Args:
-            nav_id: Unique ID for the nav point
-            label: Display label
-            src: Relative path to content
-            play_order: Reading order (1-based)
-            children: Nested nav points
-
-        Returns:
-            NavPoint instance
-        """
-        return NavPoint(
-            id=nav_id,
-            label=label,
-            src=src,
-            play_order=play_order,
-            children=children or []
-        )
-
-
-def generate_ncx(
-    output_path: Path,
-    book_title: str,
-    identifier: str,
-    nav_points: List[NavPoint]
-) -> None:
-    """
-    Main function to generate toc.ncx file.
-
-    Args:
-        output_path: Path to write toc.ncx
-        book_title: Book title
-        identifier: Unique identifier
-        nav_points: List of navigation points
-    """
-    generator = NCXGenerator()
-    generator.generate(output_path, book_title, identifier, nav_points)
-
-
-def create_nav_points_from_chapters(
-    chapters: List[dict],
-    include_cover: bool = True,
-    include_toc: bool = True
-) -> List[NavPoint]:
-    """
-    Create NCX nav points from chapter list.
-
-    Args:
-        chapters: List of chapter dictionaries with 'id', 'title', 'filename'
-        include_cover: Include cover in navigation
-        include_toc: Include TOC in navigation
-
-    Returns:
-        List of NavPoint objects
-    """
-    nav_points = []
-    play_order = 1
-
-    # Cover
-    if include_cover:
-        nav_points.append(NavPoint(
-            id="nav_cover",
-            label="Cover",
-            src="Text/cover.xhtml",
-            play_order=play_order
-        ))
-        play_order += 1
-
-    # TOC
-    if include_toc:
-        nav_points.append(NavPoint(
-            id="nav_toc",
-            label="Table of Contents",
-            src="Text/nav.xhtml",
-            play_order=play_order
-        ))
-        play_order += 1
-
-    # Chapters
-    for i, chapter in enumerate(chapters):
-        chapter_id = chapter.get('id', f'chapter_{i+1:02d}')
-        title = chapter.get('title', f'Chapter {i+1}')
-        filename = chapter.get('xhtml_filename', f'chapter{i+1:03d}.xhtml')
-
-        nav_points.append(NavPoint(
-            id=f"nav_{chapter_id}",
-            label=title,
-            src=f"Text/{filename}",
-            play_order=play_order
-        ))
-        play_order += 1
-
-    return nav_points
