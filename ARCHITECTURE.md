@@ -14,6 +14,23 @@ pipeline some comments still mention (no vector stores, no RAG modules, no
 multi-model QC fan-out); terminology overlaps (`context.xml`, `manifest.json`,
 `work/<volume_id>/`) but nothing is shared.
 
+### Coding-agent harness (2026-11-17 addition)
+
+`scripts/harness.py` and `src/harness/` provide a development-only control loop:
+read repository progress/feature state → make a bounded change → run checks →
+record evidence tied to the source snapshot → write a handoff. `AGENTS.md` is
+the shared instruction entry point and `CLAUDE.md` delegates to it.
+
+Session continuity uses plain repository files: `harness/progress.md`,
+`harness/features.json` and `harness/handoff.md`. There is no separate database,
+retrieval index or external service. Translation providers, prompt builders and
+Vietnamese bibles are independent of this development workflow.
+
+See `harness/README.md` for setup and current evidence. This coding harness is
+distinct from `src/Deepseek/mcp/harness.py`, which exposes MCP persona/routing
+resources. Detailed historical line numbers below may need re-anchoring after
+later changes; use current code and harness evidence to verify claims.
+
 ## Pipeline
 
 ```mermaid

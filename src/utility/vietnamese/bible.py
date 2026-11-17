@@ -664,5 +664,8 @@ def seed_volume_bible(work_dir: Path, *, bible_root: Optional[Path] = None, seri
         merged["narration"]["pov_character"] = seeded["narration"]["pov_character"]
     merged["volume_id"] = volume_id
     merged["series_id"] = series_id or merged.get("series_id", "")
+    # Analysis checkpoints belong to this workspace, never to a series bible.
+    if existing and "analysis_chapters" in existing:
+        merged["analysis_chapters"] = existing["analysis_chapters"]
     save_bible(path, merged)
     return merged, path

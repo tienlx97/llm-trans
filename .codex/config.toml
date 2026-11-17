@@ -1,0 +1,7 @@
+[mcp_servers.llm-translator]
+command = "python"
+args = [
+    "-m",
+    "src.Deepseek.mcp.server",
+]
+env_vars = ["DEEPSEEK_API_KEY"]

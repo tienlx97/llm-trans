@@ -17,6 +17,7 @@ Evidence discipline:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -169,26 +170,34 @@ def apply_proposals(bible: Dict[str, Any], proposals: Dict[str, Any], *, batch_s
 
 
 def analyze_volume(work_dir: Path, assistant, *, batch_chars: int = 40000,
-                   chapters: Optional[List[str]] = None) -> Dict[str, Any]:
+                   chapters: Optional[List[str]] = None, force: bool = False) -> Dict[str, Any]:
     work_dir = Path(work_dir)
     bible = load_volume_bible(work_dir) or empty_bible(volume_id=work_dir.name)
     # Story order (CHAPTER_9 < CHAPTER_10 < CHAPTER_100): each batch must see
     # only what earlier chapters established.
     jp_files = in_reading_order((work_dir / "JP").glob("*.md"))
-    if chapters:
+    if chapters is not None:
         wanted = set(chapters)
         jp_files = [p for p in jp_files if p.stem in wanted]
+    # Keep progress in the same atomic file as the proposals: a failed batch
+    # must never be stamped as done. Hash the text actually sent to the model.
+    progress = bible.setdefault("analysis_chapters", {})
+    sources = {p: p.read_text(encoding="utf-8") for p in jp_files}
+    hashes = {p.stem: hashlib.sha256(text.encode("utf-8")).hexdigest()
+              for p, text in sources.items()}
+    jp_files = [p for p in jp_files if force or progress.get(p.stem) != hashes[p.stem]]
+    logger.info("[VI-BIBLE] %d chapter(s) need analysis", len(jp_files))
     batches: List[List[Path]] = [[]]
     size = 0
     for path in jp_files:
-        length = len(path.read_text(encoding="utf-8"))
+        length = len(sources[path])
         if batches[-1] and size + length > batch_chars:
             batches.append([])
             size = 0
         batches[-1].append(path)
         size += length
     for n, batch in enumerate(b for b in batches if b):
-        texts = {p.stem: p.read_text(encoding="utf-8") for p in batch}
+        texts = {p.stem: sources[p] for p in batch}
         source = "\n\n".join(texts.values())
         user = (f"<bible_so_far>\n{_bible_summary(bible)}\n</bible_so_far>\n\n" + "\n\n".join(
             f"<chapter id='{cid}'>\n{text}\n</chapter>" for cid, text in texts.items()))
@@ -197,6 +206,7 @@ def analyze_volume(work_dir: Path, assistant, *, batch_chars: int = 40000,
             logger.info("[VI-BIBLE] dry run: batch %d payload at %s", n + 1, result.get("payload_path"))
             continue
         apply_proposals(bible, result, batch_source=source, chapter_ids=list(texts))
+        progress.update({cid: hashes[cid] for cid in texts})
         save_bible(volume_bible_path(work_dir), bible)   # checkpoint after every batch
     return bible
 

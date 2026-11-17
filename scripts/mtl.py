@@ -255,9 +255,11 @@ def cmd_import_url(args: argparse.Namespace) -> int:
         print(f"  Synced into existing workspace: added {len(result.synced['added'])}, "
               f"changed {len(result.synced['changed'])} (set back to pending), unchanged {len(result.synced['unchanged'])}")
     if args.run:
-        _after_sync(result.volume_id, result.synced, args.provider)
+        if not args.incremental:
+            _after_sync(result.volume_id, result.synced, args.provider)
         return _continue_pipeline(result.volume_id, provider=args.provider, series_id=None,
-                                  thinking_log_enabled=None, prep_provider=args.prep_provider)
+                                  thinking_log_enabled=None, prep_provider=args.prep_provider,
+                                  incremental=args.incremental, window=args.window)
     print(f"\nNext: python scripts/mtl.py resume {result.volume_id}")
     return 0
 
@@ -365,8 +367,35 @@ def _maybe_epubcheck(epub_path) -> None:
     print(f"  epubcheck: {'valid' if result.ok else 'ERRORS'} — {result.summary}")
 
 
+def _translate_incrementally(volume_id: str, provider: str, window: int, thinking_log_enabled):
+    """Commit analysis before translation, and stop before advancing past a failure."""
+    from src.OpenAI.agent import _filter_completed_chapters
+    from src.CLI.agent import reading_order
+    from src.utility.vietnamese.analyze import analyze_volume
+    from src.utility.vietnamese.assistant import make_assistant
+
+    work_dir = WORK_DIR / volume_id
+    pending = _filter_completed_chapters(
+        work_dir, sorted((work_dir / "JP").glob("CHAPTER_*.md"), key=reading_order))
+    translate = _resolve_translate_volume(provider)
+    results = {}
+    assistant = None
+    for start in range(0, len(pending), window):
+        batch = pending[start:start + window]
+        ids = [p.stem for p in batch]
+        print(f"[incremental] {start + 1}-{start + len(batch)}/{len(pending)} pending: {', '.join(ids)}")
+        if assistant is None:
+            assistant = make_assistant(work_dir, provider=provider if provider in CLI_PROVIDERS else None)
+        analyze_volume(work_dir, assistant, chapters=ids)
+        results.update(translate(volume_id, chapters=ids, thinking_log_enabled=thinking_log_enabled))
+        if _filter_completed_chapters(work_dir, batch):
+            raise RuntimeError("Incremental window has unfinished chapters; fix/retry it before continuing.")
+    return results
+
+
 def _continue_pipeline(volume_id: str, *, provider: str | None, series_id: str | None,
-                       thinking_log_enabled, skip_prep: bool = False, prep_provider: str | None = None) -> int:
+                       thinking_log_enabled, skip_prep: bool = False, prep_provider: str | None = None,
+                       incremental: bool = False, window: int = 20) -> int:
     """Run whatever is unfinished for this volume, in order. Each phase is
     itself resumable: prep reuses finished turns, translate skips completed
     chapters, build is idempotent."""
@@ -375,6 +404,9 @@ def _continue_pipeline(volume_id: str, *, provider: str | None, series_id: str |
     except UnsupportedTargetLanguage as exc:
         print(f"\n{exc}")
         return 1
+    if incremental and (window < 1 or volume_target_language(WORK_DIR / volume_id) != "vi"):
+        print("--incremental requires a Vietnamese workspace and --window >= 1")
+        return 2
     state = (_manifest(volume_id).get("pipeline_state") or {})
     prep_state = state.get("prep") or {}
     if not skip_prep and prep_state.get("status") != "completed":
@@ -391,20 +423,30 @@ def _continue_pipeline(volume_id: str, *, provider: str | None, series_id: str |
             return 1
         print(f"[prep] {len(prep_receipt['blocks_populated'])}"
               f"/{len(prep_receipt['blocks_populated']) + len(prep_receipt['blocks_pending'])} context.xml blocks populated")
-        _after_prep(volume_id, assistant_provider=chosen_prep if chosen_prep in CLI_PROVIDERS else None)
+        if incremental:
+            _after_prep(volume_id, analyze=False)
+        else:
+            _after_prep(volume_id, assistant_provider=chosen_prep if chosen_prep in CLI_PROVIDERS else None)
     else:
         print("[prep] already completed" if not skip_prep else "[prep] skipped")
         if volume_target_language(WORK_DIR / volume_id) == "vi" and not (WORK_DIR / volume_id / ".context" / "bible_vi.json").exists():
-            _after_prep(volume_id)
+            if incremental:
+                _after_prep(volume_id, analyze=False)
+            else:
+                _after_prep(volume_id)
 
     from src.CLI.runner import CliError
 
     try:
-        results = _resolve_translate_volume(provider)(volume_id, thinking_log_enabled=thinking_log_enabled)
-    except CliError as exc:
+        if incremental:
+            results = _translate_incrementally(volume_id, provider, window, thinking_log_enabled)
+        else:
+            results = _resolve_translate_volume(provider)(volume_id, thinking_log_enabled=thinking_log_enabled)
+    except (CliError, RuntimeError) as exc:
         print(f"[translate] stopped: {exc}")
+        mode_flags = f" --incremental --window {window}" if incremental else ""
         print(f"            Finished chapters are kept. Continue later with: "
-              f"python scripts/mtl.py resume {volume_id} --provider {provider}")
+              f"python scripts/mtl.py resume {volume_id} --provider {provider}{mode_flags}")
         return 1
     chapters = _manifest(volume_id).get("chapters") or []
     done = sum(1 for c in chapters if isinstance(c, dict) and c.get("translation_status") == "completed")
@@ -434,7 +476,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 2
         return _continue_pipeline(args.volume_id, provider=args.provider, series_id=args.series_id,
                                   thinking_log_enabled=False if args.no_thinking_log else None,
-                                  prep_provider=args.prep_provider)
+                                  prep_provider=args.prep_provider, incremental=args.incremental, window=args.window)
     if _is_url(source):
         from src.utility.webimport.http import AccessDenied
         from src.utility.webimport.importer import import_work, parse_range
@@ -458,7 +500,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"      updated existing workspace: {len(result.synced['added'])} new, "
                   f"{len(result.synced['changed'])} changed (set back to pending), "
                   f"{len(result.synced['unchanged'])} unchanged")
-            _after_sync(volume_id, result.synced, args.provider)
+            if not args.incremental:
+                _after_sync(volume_id, result.synced, args.provider)
     else:
         try:
             require_provider_support(_configured_provider(args.provider), lang)
@@ -476,7 +519,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"\n[1/5] Extracted -> {volume_id}/manifest.json  (target: {lang})")
     return _continue_pipeline(volume_id, provider=args.provider, series_id=args.series_id,
                               thinking_log_enabled=False if args.no_thinking_log else None,
-                              prep_provider=args.prep_provider)
+                              prep_provider=args.prep_provider, incremental=args.incremental, window=args.window)
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -485,7 +528,8 @@ def cmd_resume(args: argparse.Namespace) -> int:
         return 1
     return _continue_pipeline(args.volume_id, provider=args.provider, series_id=args.series_id,
                               thinking_log_enabled=False if args.no_thinking_log else None,
-                              skip_prep=args.skip_prep, prep_provider=args.prep_provider)
+                              skip_prep=args.skip_prep, prep_provider=args.prep_provider,
+                              incremental=args.incremental, window=args.window)
 
 
 def _require_vi(volume_id: str) -> Path | None:
@@ -559,7 +603,7 @@ def cmd_bible_vi(args: argparse.Namespace) -> int:
         if vb.load_volume_bible(work_dir) is None:
             vb.seed_volume_bible(work_dir, bible_root=bible_root, series_id=series_id)
         analyze_volume(work_dir, make_assistant(work_dir, dry_run=args.dry_run, provider=args.provider),
-                       chapters=args.chapters)
+                       chapters=args.chapters, force=args.force_analyze)
         print("Analysis " + ("dry run written to DRY_RUN/assistant/" if args.dry_run else "merged into bible_vi.json"))
         did = True
     if args.lock:
@@ -664,6 +708,20 @@ def _add_prep_provider(p: argparse.ArgumentParser) -> None:
                         "else config.yaml)")
 
 
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
+
+
+def _add_incremental(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--incremental", action="store_true",
+                        help="VI: analyze then translate each pending chapter window, with checkpoints")
+    parser.add_argument("--window", type=_positive_int, default=20, metavar="N",
+                        help="With --incremental: chapters per window (default: 20; 1 = chapter by chapter)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mtl",
@@ -696,6 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("--no-extract", action="store_true", help="Only download and build the JP EPUB")
     p_import.add_argument("--run", action="store_true", help="Continue with prep -> translate -> qc -> build")
     p_import.set_defaults(func=cmd_import_url)
+    _add_incremental(p_import)
 
     p_prep = subparsers.add_parser("prep", help="Fill context.xml (and seed bible_vi.json for VI)")
     p_prep.add_argument("volume_id", type=str, help="Volume ID (directory name in work/)")
@@ -760,6 +819,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bible.add_argument("volume_id", type=str)
     p_bible.add_argument("--seed", action="store_true", help="(Re)seed from context.xml; never overwrites locked/stronger data")
     p_bible.add_argument("--analyze", action="store_true", help="LLM pass: relationships, pronoun matrix, terms (paid)")
+    p_bible.add_argument("--force-analyze", action="store_true", help="With --analyze: reanalyze even unchanged chapters")
     p_bible.add_argument("--lock", action="store_true", help="Approve: lock every name/term that has a Vietnamese form")
     p_bible.add_argument("--promote", action="store_true", help="Merge this volume into bibles/<series>/vi/bible_vi.json")
     p_bible.add_argument("--series-id", type=str, default=None)
@@ -813,6 +873,7 @@ def build_parser() -> argparse.ArgumentParser:
              "cannot answer prompts pass this.",
     )
     p_run.set_defaults(func=cmd_run)
+    _add_incremental(p_run)
 
     p_resume = subparsers.add_parser("resume", help="Continue an interrupted volume (unfinished phases/chapters only)")
     p_resume.add_argument("volume_id", type=str)
@@ -821,6 +882,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume.add_argument("--skip-prep", action="store_true", help="Translate without context.xml prep")
     p_resume.add_argument("--no-thinking-log", action="store_true")
     p_resume.set_defaults(func=cmd_resume)
+    _add_incremental(p_resume)
 
     p_list = subparsers.add_parser("list", help="List volumes in work/")
     p_list.set_defaults(func=cmd_list)

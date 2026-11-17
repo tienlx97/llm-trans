@@ -17,7 +17,8 @@ dsh/
 # the exception. Vendored API docs, QC calibration excerpts, and full-text
 # commercial ebook extracts remain local and must not be staged.
 .agents/
-.codex/
+.codex/*
+!.codex/config.toml
 .grok/
 .dsh/
 
@@ -28,7 +29,6 @@ epub-to-xtc-converter/
 .claude/
 CLAUDE.local.md
 .claude.json
-CLAUDE.md
 
 # ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
@@ -82,9 +82,15 @@ work/
 # definitions, the orchestrator persona, and dev planning notes. The tracked
 # evaluator entrypoint and mtl-qc adapter are narrow exceptions.
 .github/
-/AGENTS.md
 /PLANNING.md
 # Root-anchored on purpose: an unanchored `bible/` also swallowed the source
 # package src/utility/bible/, which is why it never reached the remote.
 /bible/
 /bibles/
+<<<<<<< HEAD
+=======
+
+# Shipped coding-agent harness (AGENTS.md, CLAUDE.md, harness/, src/harness/);
+# only per-run state stays local.
+.harness/
+>>>>>>> 236200f (Add coding-agent harness, incremental VI translation, translate-chap script)

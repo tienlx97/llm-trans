@@ -1,5 +1,7 @@
 # LLM Translator - DeepSeek/Qwen/OpenAI/Anthropic/Gemini-Powered
 
+[English](README.md) | [Tiếng Việt](READ_ME.vi.md)
+
 **Selectable-provider pipeline** for Japanese → English and Japanese → Vietnamese
 light novel translation. Extract (an EPUB, or a Syosetu/Kakuyomu URL), prep,
 translate, QC, build — and remember the series for next time.
@@ -9,6 +11,11 @@ Phase 2 selects one isolated translation route through `translation.provider`:
 for the signed-in subscription CLIs). Each route owns its native
 client, prompt, conversation ledger, cache policy, continuation behavior, and
 error handling; selecting one does not silently alter any of the others.
+
+Signed-in **Codex CLI** and **Claude Code** are also available through
+`--provider codex` / `--provider claude`. For long Vietnamese web novels,
+`--incremental --window 20` updates the character/terminology bible and translates
+one group at a time; see [incremental translation](#incremental-vietnamese-translation-for-long-web-novels).
 
 A content-safety refusal mid-volume does not end the run: the chapter is
 handed to DeepSeek with the source provider's already-established translation
@@ -35,6 +42,7 @@ decisions inherited rather than reinvented. See
   - [Japanese → Vietnamese](#japanese--vietnamese)
     - [Windows quick start (Vietnamese)](#windows-quick-start-vietnamese)
     - [Input sources: EPUB, web novel URL, existing workspace](#input-sources-epub-web-novel-url-existing-workspace)
+    - [Incremental Vietnamese translation for long web novels](#incremental-vietnamese-translation-for-long-web-novels)
     - [After the first run: check, correct, continue](#after-the-first-run-check-correct-continue)
     - [Without an API key: Codex CLI or Claude Code](#without-an-api-key-codex-cli-or-claude-code)
     - [How a workspace gets its language](#how-a-workspace-gets-its-language)
@@ -47,6 +55,7 @@ decisions inherited rather than reinvented. See
   - [Configuration](#configuration)
   - [File Structure](#file-structure)
   - [CLI Reference](#cli-reference)
+  - [Coding-agent harness](#coding-agent-harness)
   - [Testing](#testing)
   - [MCP Tools](#mcp-tools)
   - [Requirements](#requirements)
@@ -521,7 +530,7 @@ builders byte-for-byte against the previous release).
 | Web import | `src/utility/webimport/` |
 | EPUB validation (built-in + optional epubcheck) | `src/builder/validation.py` |
 
-**Providers.** Vietnamese is wired for **OpenAI** (Responses API, conversation
+**Providers.** Vietnamese supports **Codex CLI**, **Claude Code**, **OpenAI** (Responses API, conversation
 state, Batch, caching, continuation: the same route as English) and
 **Gemini** (Interactions API chain, Batch + explicit cache). DeepSeek, Qwen
 and Anthropic keep their English routes; asked to translate a Vietnamese
@@ -634,6 +643,67 @@ python scripts\mtl.py build <vol>                # rebuild the EPUB after editin
 ```
 
 The finished book is written to `output\<title>_VI.epub`.
+
+### Incremental Vietnamese translation for long web novels
+
+Download the selected episodes, then analyze and translate in windows instead
+of analyzing every chapter before translation starts:
+
+```powershell
+python scripts/mtl.py run "<url>" --target vi --provider claude --incremental --window 20
+python scripts/mtl.py resume <vol> --provider claude --incremental --window 20
+```
+
+For a work with 938 published episodes, a work-page URL without `--range`
+selects all currently available episodes; add `--range 1-938` to select that
+fixed range. An episode URL can select just that episode instead. If the work
+is already downloaded, use `resume`; it does not fetch new episodes from the site.
+
+Each window contains up to 20 pending chapters in reading order. The Vietnamese
+bible is updated first, then those chapters are translated before the next
+window is analyzed. Use `--window 1` for chapter-by-chapter updates. This also
+works with `import-url ... --run --incremental --window 20`. Without
+`--incremental`, pipeline phase ordering stays unchanged. Download and initial
+`context.xml` prep still happen before the windows; this option changes the
+bible-analysis/translation sequence, not prep's source selection.
+
+Analysis saves a SHA-256 text hash per successful chapter in the workspace's
+`.context/bible_vi.json` (`analysis_chapters`), atomically with the bible updates.
+Repeated analysis skips unchanged chapters; interrupted batches and edited text
+are retried. Dry runs never advance these checkpoints. Reseeding preserves the
+workspace's checkpoints; they are not inherited by later volumes. Existing
+bibles have no historical checkpoints, so their selected chapters are analyzed
+once to establish them. Reanalysis merges through the existing evidence/lock
+rules; it does not erase earlier decisions automatically.
+
+If translation fails or leaves unfinished chapters, the pipeline stops before
+analyzing the next window. Repeat `resume` with the same incremental flags:
+completed translations are skipped and successful analysis is reused. Previously
+completed chapters are not backfilled by incremental mode. QC and EPUB build run
+after all windows finish.
+
+For ongoing novels, repeat the URL command to import new episodes into the same
+workspace (same novel, starting episode and target language). Keep the range
+start fixed when extending it, e.g. `--range 1-50`, then `--range 1-100`.
+To detect edits to already cached episodes as well as new releases:
+
+```powershell
+python scripts/mtl.py import-url "<url>" --target vi --refresh --run --provider claude --incremental --window 20
+```
+
+Changed chapters are reset to pending by import sync. Manually editing a JP
+file does not reset its translation status; use `repair <vol> --reset CHAPTER_ID`
+if that chapter also needs translating again.
+
+To deliberately reanalyze unchanged text:
+
+```powershell
+python scripts/mtl.py bible-vi <vol> --analyze --force-analyze --provider claude
+```
+
+`--chapters CHAPTER_01 CHAPTER_02` can restrict this operation. For translation
+providers other than `codex`/`claude`, bible analysis uses the configured
+`assistant.provider`.
 
 ### After the first run: check, correct, continue
 
@@ -772,8 +842,12 @@ python scripts\mtl.py bible-vi <vol> --lock            # lock every name/term th
 python scripts\mtl.py bible-vi <vol> --promote --series-id my_series   # carry it into the next volume
 ```
 
-Set `project.languages.vi.bible.auto_analyze: true` to run the analysis
-automatically during `run`/`resume`.
+For the regular pipeline, `project.languages.vi.bible.auto_analyze: true`
+enables analysis in the after-prep hook; a CLI assistant (`codex`/`claude`)
+also enables it there by default. An already completed prep with an existing
+bible is skipped by `resume`. Use `--incremental` to analyze pending translation
+windows regardless of this setting, or `bible-vi --analyze` to explicitly resume
+unfinished analysis. Analysis checkpoints skip unchanged chapters in either mode.
 
 ### Vietnamese QC and selective repair
 
@@ -942,6 +1016,7 @@ llm-trans/
 ├── requirements.txt            ← Python dependencies (requirements-dev.txt adds pytest)
 ├── README.md                   ← This file
 ├── ARCHITECTURE.md             ← Maintainer-level architecture map
+├── READ_ME.vi.md               ← Vietnamese setup and operator guide
 ├── mtl.bat / mtl.sh            ← CLI launcher (Windows / Linux+macOS)
 ├── mtl-ts.bat / mtl-ts.sh      ← TypeScript console launcher
 ├── .mcp.json                   ← Registers the MCP server for Claude Code
@@ -991,7 +1066,7 @@ part of the repository. `workflows/qc-gate.wf.mjs` and the two
 ```bash
 python scripts/mtl.py extract <epub_path> [--target vi] [--volume-id ID] [--force-rerun]
                                               # Phase 1: EPUB → JP chapters + barebone context.xml
-python scripts/mtl.py import-url <url> [--target vi] [--range 1-50] [--volume-id ID] [--refresh] [--no-extract] [--run]
+python scripts/mtl.py import-url <url> [--target vi] [--range 1-50] [--volume-id ID] [--refresh] [--no-extract] [--run [--incremental --window N]]
                                               # Syosetu/Kakuyomu → JP workspace (same layout as extract)
 python scripts/mtl.py prep <vol_id> [--series-id S] [--force-rerun] [--prep-provider P]
                                               # Fills context.xml (VI: also seeds bible_vi.json)
@@ -1000,14 +1075,14 @@ python scripts/mtl.py translate <vol_id> [--chapters C...] [--provider P] [--no-
 python scripts/mtl.py qc <vol_id> [--llm] [--dry-run] [--chapters C...] [--provider P]
                                               # EN: filesystem-only gate. VI: Vietnamese QC (+ semantic review)
 python scripts/mtl.py repair <vol_id> ...     # VI: --mechanical | --severity S | --issue ID | --reset CHAPTER... | --reset all  [--chapters C...] [--dry-run] [--provider P]
-python scripts/mtl.py bible-vi <vol_id> ...   # VI: --seed | --analyze [--chapters C...] [--dry-run] [--provider P] | --lock | --promote [--series-id S] | --show
+python scripts/mtl.py bible-vi <vol_id> ...   # VI: --seed | --analyze [--force-analyze] [--chapters C...] [--dry-run] [--provider P] | --lock | --promote [--series-id S] | --show
 python scripts/mtl.py build <vol_id> [--output NAME] [--profile PROFILE] [--emit-xtc xtc|xtch] [--dry-run]
                                               # Phase 4: translation → EPUB
 python scripts/mtl.py run <epub_path|url> [--target vi] [--volume-id ID] [--series-id S] [--range R]
-                      [--provider P] [--prep-provider P] [--no-thinking-log] [--force-rerun]
+                      [--provider P] [--prep-provider P] [--incremental --window N] [--no-thinking-log] [--force-rerun]
                                               # extract/import → prep → translate → qc → build
                                               # same URL again: adds new episodes to the existing workspace
-python scripts/mtl.py resume <vol_id> [--provider P] [--prep-provider P] [--series-id S] [--skip-prep] [--no-thinking-log]
+python scripts/mtl.py resume <vol_id> [--provider P] [--prep-provider P] [--series-id S] [--skip-prep] [--incremental --window N] [--no-thinking-log]
                                               # Continue an interrupted volume
 python scripts/mtl.py list                    # List volumes in work/
 python scripts/mtl.py status <vol_id>         # Pipeline state, target language, chapter completion
@@ -1021,12 +1096,37 @@ python scripts/mtl.py status <vol_id>         # Pipeline state, target language,
 profile and a configured `builder.xtc` converter.
 
 Without `--target`, every command behaves as before (English). If
+Without `--target`, new workspaces use `project.target_language` (shipped as
+`en`); existing workspaces retain their recorded language. If
 `EPUBCHECK_JAR` points at an `epubcheck.jar` and Java is installed, `build`
 also prints the epubcheck verdict.
 
-No `bible` CLI command — see [Series Continuity](#series-continuity--the-bible-writer).
+`bible-vi` manages the Vietnamese bible. English bible writing uses MCP/IDE-agent
+tools — see [Series Continuity](#series-continuity--the-bible-writer).
 
 ---
+
+## Coding-agent harness
+
+Development agents share [AGENTS.md](AGENTS.md) and [CLAUDE.md](CLAUDE.md).
+The harness records feature acceptance criteria, progress, file-based handoffs
+and verification evidence tied to the current source snapshot.
+
+```powershell
+python scripts/harness.py start
+python scripts/harness.py verify --profile python
+# For console changes, after installing ts/ dependencies:
+python scripts/harness.py verify --profile all
+```
+
+Use `harness/progress.md`, `harness/features.json` and `harness/handoff.md` to
+continue work across sessions. Reports are saved under `.harness/runs/` and
+ignored by Git. Feature completion rejects failed, incomplete or stale evidence.
+The harness uses repository files; no database, index or external service is
+required. Translation providers, prompts and Vietnamese bibles remain independent.
+
+See [the harness guide](harness/README.md). The workflow follows
+[Learn Harness Engineering](https://walkinglabs.github.io/learn-harness-engineering/en/).
 
 ## Testing
 
